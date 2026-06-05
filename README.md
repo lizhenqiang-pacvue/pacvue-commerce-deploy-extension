@@ -79,7 +79,9 @@ Cursor / VS Code：**Extensions: Install from VSIX...** → 选择生成的 `pac
 - 当前 Commerce 项目 `.github` 目录下的 CI 配置原文（workflow 优先展示，便于 Agent 对照各项目不规范配置）
 - 结构化 JSON payload（供后续 Agent 读取）
 
-同一 `runId` 只会创建一次 Issue。Token 需具备扩展仓库的 `repo` 权限（创建 Issue）。
+同一 `runId` 只会创建一次 Issue。Token / `gh` 需能在 **扩展仓库**（默认 `lizhenqiang-pacvue/pacvue-commerce-deploy-extension`）创建 Issue，仅有 Commerce 仓库权限不够。
+
+> **注意**：只有扩展检测到 workflow run 最终状态为 **Failed** 时才会建 Issue。若轮询报错一直显示 `In Progress`，说明尚未拿到 run 结果，也不会建 Issue（请升级到最新版 VSIX 并配置 Token 轮询）。
 
 ## 命令行验证（可选）
 

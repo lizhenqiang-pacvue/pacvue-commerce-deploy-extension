@@ -4,6 +4,7 @@ const { spawnSync } = require("node:child_process")
 
 const GH_RUN_JSON_FIELDS = "databaseId,status,conclusion,url,displayTitle,createdAt,updatedAt"
 const GH_RUN_JSON_FIELDS_LEGACY = "id,status,conclusion,url,displayTitle,createdAt,updatedAt"
+const GITHUB_ISSUE_BODY_MAX_CHARS = 60000
 
 function isUnknownGhJsonFieldError(stdout, stderr) {
   return /Unknown JSON field:/i.test(`${stdout}\n${stderr}`)
@@ -1024,10 +1025,47 @@ async function getWorkflowRunJobsSummary({ repoRoot, runId, getConfiguredToken, 
   }
 }
 
+function trimIssueBody(body) {
+  const text = String(body ?? "")
+
+  if (text.length <= GITHUB_ISSUE_BODY_MAX_CHARS) {
+    return text
+  }
+
+  return `${text.slice(0, GITHUB_ISSUE_BODY_MAX_CHARS - 120)}\n\n...(issue body truncated for GitHub size limit)...`
+}
+
+function createDeployFailureIssueViaGh({ issueRepoSlug, title, body, runGhCommand }) {
+  const result = runGhCommand(
+    ["issue", "create", "--repo", issueRepoSlug, "--title", title, "--body", body],
+    process.cwd()
+  )
+
+  if (result.status === 0) {
+    const issueUrl = String(result.stdout ?? "")
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => /^https?:\/\//i.test(line))
+
+    return {
+      ok: true,
+      transport: "gh",
+      issueUrl: issueUrl || null
+    }
+  }
+
+  return {
+    ok: false,
+    error: previewCommandOutput(result.stdout, result.stderr, "Failed to create deploy failure issue via gh.")
+  }
+}
+
 async function createDeployFailureIssue({ issueRepoSlug, payload, getConfiguredToken, runGhCommand }) {
   const tokenOptions = { getConfiguredToken }
   const title = buildDeployFailureIssueTitle(payload)
-  const body = buildDeployFailureIssueBody(payload)
+  const body = trimIssueBody(buildDeployFailureIssueBody(payload))
+  let lastError = null
 
   if (canUseGithubApi(tokenOptions)) {
     try {
@@ -1049,42 +1087,23 @@ async function createDeployFailureIssue({ issueRepoSlug, payload, getConfiguredT
         }
       }
 
-      return {
-        ok: false,
-        error: response.body?.message || `GitHub API issue create failed with status ${response.statusCode}.`
-      }
+      lastError = response.body?.message || `GitHub API issue create failed with status ${response.statusCode}.`
     } catch (error) {
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : "Failed to create deploy failure issue via GitHub API."
-      }
+      lastError = error instanceof Error ? error.message : "Failed to create deploy failure issue via GitHub API."
     }
   }
 
   if (canUseGithubCli() && typeof runGhCommand === "function") {
-    const result = runGhCommand(
-      ["issue", "create", "--repo", issueRepoSlug, "--title", title, "--body", body],
-      process.cwd()
-    )
-
-    if (result.status === 0) {
-      const issueUrl = String(result.stdout ?? "")
-        .trim()
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find((line) => /^https?:\/\//i.test(line))
-
-      return {
-        ok: true,
-        transport: "gh",
-        issueUrl: issueUrl || null
-      }
+    const ghResult = createDeployFailureIssueViaGh({ issueRepoSlug, title, body, runGhCommand })
+    if (ghResult.ok) {
+      return ghResult
     }
 
-    return {
-      ok: false,
-      error: previewCommandOutput(result.stdout, result.stderr, "Failed to create deploy failure issue via gh.")
-    }
+    lastError = ghResult.error || lastError
+  }
+
+  if (lastError) {
+    return { ok: false, error: lastError }
   }
 
   return {

@@ -371,6 +371,15 @@ class DeployViewProvider {
     })
 
     if (!result.ok) {
+      const issueError = result.error || "Unknown error while creating deploy failure issue."
+      await vscode.window.showErrorMessage(
+        `Failed to create deploy failure issue in ${issueRepo}: ${issueError}`,
+        "Open Settings"
+      ).then((selection) => {
+        if (selection === "Open Settings") {
+          void vscode.commands.executeCommand("workbench.action.openSettings", "pacvueDeploy.githubToken")
+        }
+      })
       return result
     }
 
