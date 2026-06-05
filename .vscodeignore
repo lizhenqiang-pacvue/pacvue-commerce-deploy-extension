@@ -1,2 +1,5 @@
 *-progress.md
 *.vsix
+.gitignore
+.cursor/**
+.vscode/**

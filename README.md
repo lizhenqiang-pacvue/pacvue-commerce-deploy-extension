@@ -40,7 +40,16 @@
 5. 点击 **Run**；在 **Result** 区查看状态与 Run URL
 6. 需要时点击 **Cancel**
 
-## VSIX 安装
+## 安装
+
+### 从 GitHub Releases 安装（推荐）
+
+1. 打开 [Releases](https://github.com/lizhenqiang-pacvue/pacvue-commerce-deploy-extension/releases) 页面
+2. 下载最新版本的 `pacvue-commerce-deploy-visual-*.vsix`
+3. Cursor / VS Code：**Extensions: Install from VSIX...** → 选择下载的 `.vsix` 文件
+4. **Reload Window** 后，活动栏会出现 **Pacvue Deploy** 面板
+
+### 本地打包（可选）
 
 ```bash
 cd pacvue-commerce-deploy-extension
