@@ -803,10 +803,280 @@ function getMissingGithubAuthPayload() {
   }
 }
 
+function parseOwnerRepoSlug(repoSlug) {
+  const match = String(repoSlug ?? "")
+    .trim()
+    .match(/^([^/]+)\/([^/]+)$/)
+
+  if (!match) {
+    throw new Error(`Invalid GitHub repository slug: ${repoSlug || "(empty)"}`)
+  }
+
+  return buildGithubApiConfig("github.com", match[1], match[2].replace(/\.git$/i, ""))
+}
+
+function buildDeployFailureIssueTitle(payload) {
+  const workflowName = payload.parsed?.workflow?.name || payload.parsed?.workflow?.file || "workflow"
+  const targetBranch = payload.parsed?.targetBranch || payload.targetBranch || "unknown-branch"
+  const runId = payload.run?.databaseId
+
+  if (payload.failureType === "trigger") {
+    return `[auto-triage] Deploy trigger failed: ${workflowName} @ ${targetBranch}`
+  }
+
+  return `[auto-triage] Deploy failed: ${workflowName} @ ${targetBranch}${runId ? ` (run #${runId})` : ""}`
+}
+
+function getGithubFileFenceLanguage(filePath) {
+  const ext = path.extname(String(filePath ?? "")).toLowerCase()
+
+  if (ext === ".yml" || ext === ".yaml") {
+    return "yaml"
+  }
+
+  if (ext === ".json") {
+    return "json"
+  }
+
+  if (ext === ".sh") {
+    return "bash"
+  }
+
+  if (ext === ".md") {
+    return "markdown"
+  }
+
+  return "text"
+}
+
+function buildGithubFilesIssueSection(githubSnapshot) {
+  if (!githubSnapshot || githubSnapshot.missing) {
+    return "_No `.github` directory found in the current workspace._"
+  }
+
+  if (!Array.isArray(githubSnapshot.files) || !githubSnapshot.files.length) {
+    return "_No readable files found under `.github`._"
+  }
+
+  const sections = githubSnapshot.files.map((file) => {
+    if (!file.content) {
+      return `### \`${file.path}\`\n\n_Skipped: ${file.skipped || "unavailable"} (${file.size ?? 0} bytes)._`
+    }
+
+    const lang = getGithubFileFenceLanguage(file.path)
+    const truncatedNote = file.truncated ? "\n\n_Content truncated for issue size limits._" : ""
+
+    return `### \`${file.path}\`${truncatedNote}\n\n\`\`\`${lang}\n${file.content}\n\`\`\``
+  })
+
+  const footer =
+    typeof githubSnapshot.totalDiscovered === "number" && githubSnapshot.totalDiscovered > githubSnapshot.files.length
+      ? `\n\n_Showing ${githubSnapshot.files.length} of ${githubSnapshot.totalDiscovered} files under \`.github\`._`
+      : ""
+
+  return `${sections.join("\n\n")}${footer}`
+}
+
+function buildDeployFailureIssueBody(payload) {
+  const workflowFile = payload.parsed?.workflow?.file || ""
+  const workflowName = payload.parsed?.workflow?.name || workflowFile || "unknown"
+  const targetBranch = payload.parsed?.targetBranch || payload.targetBranch || ""
+  const commerceRepo = payload.commerceRepo || "unknown"
+  const runUrl = payload.run?.url || ""
+  const conclusion = payload.run?.conclusion || payload.conclusion || ""
+  const errorMessage = payload.message || payload.error || ""
+  const command = payload.command || ""
+  const jobsSummary = Array.isArray(payload.jobsSummary) ? payload.jobsSummary : []
+  const githubSnapshot = payload.githubSnapshot ?? null
+
+  const failedStepsBlock =
+    jobsSummary.length > 0
+      ? jobsSummary
+          .map((job) => {
+            const failedSteps = Array.isArray(job.failedSteps) ? job.failedSteps.join(", ") : ""
+            return `- **${job.name}** (${job.conclusion || "unknown"})${failedSteps ? `: ${failedSteps}` : ""}`
+          })
+          .join("\n")
+      : "_No failed job details were available from GitHub Actions API._"
+
+  const structuredPayload = {
+    type: payload.failureType === "trigger" ? "deploy_trigger_failure" : "deploy_run_failure",
+    commerceRepo,
+    workflow: workflowFile,
+    workflowName,
+    targetBranch,
+    runId: payload.run?.databaseId ?? null,
+    runUrl: runUrl || null,
+    conclusion: conclusion || null,
+    command: command || null,
+    errorMessage: errorMessage || null,
+    extensionVersion: payload.extensionVersion || null,
+    reportedAt: new Date().toISOString(),
+    githubFiles: Array.isArray(githubSnapshot?.files)
+      ? githubSnapshot.files.map((file) => ({
+          path: file.path,
+          size: file.size ?? null,
+          truncated: Boolean(file.truncated),
+          skipped: file.skipped || null
+        }))
+      : []
+  }
+
+  return [
+    "## Summary",
+    payload.failureType === "trigger"
+      ? "Pacvue Deploy failed to trigger the GitHub Actions workflow."
+      : "Pacvue Deploy workflow run completed with a non-success result.",
+    "",
+    "## Context",
+    "",
+    "| Field | Value |",
+    "| --- | --- |",
+    `| Commerce repo | \`${commerceRepo}\` |`,
+    `| Workflow | \`${workflowName}\` |`,
+    `| Workflow file | \`${workflowFile || "n/a"}\` |`,
+    `| Target branch | \`${targetBranch || "n/a"}\` |`,
+    runUrl ? `| Run URL | ${runUrl} |` : "| Run URL | n/a |",
+    conclusion ? `| Conclusion | \`${conclusion}\` |` : null,
+    "",
+    "## Error",
+    "",
+    "```text",
+    errorMessage || "(no error message captured)",
+    "```",
+    "",
+    "## Failed jobs",
+    "",
+    failedStepsBlock,
+    "",
+    "## Project `.github` configuration",
+    "",
+    buildGithubFilesIssueSection(githubSnapshot),
+    "",
+    command
+      ? ["## Command", "", "```bash", command, "```", ""].join("\n")
+      : null,
+    "## Payload",
+    "",
+    "```json",
+    JSON.stringify(structuredPayload, null, 2),
+    "```",
+    "",
+    "_Auto-created by Pacvue Commerce Deploy extension. Label or assign for agent triage._"
+  ]
+    .filter(Boolean)
+    .join("\n")
+}
+
+async function getWorkflowRunJobsSummary({ repoRoot, runId, getConfiguredToken, runGit }) {
+  const tokenOptions = { getConfiguredToken }
+  if (!canUseGithubApi(tokenOptions) || !runId) {
+    return null
+  }
+
+  try {
+    const apiConfig = getGithubRepoInfo(repoRoot, runGit)
+    const response = await githubApiRequest(
+      "GET",
+      buildRepoApiPath(apiConfig, `/actions/runs/${encodeURIComponent(String(runId))}/jobs`),
+      null,
+      getGithubToken(tokenOptions),
+      apiConfig
+    )
+
+    if (!response.ok) {
+      return null
+    }
+
+    return (response.body?.jobs ?? [])
+      .map((job) => ({
+        name: job.name,
+        conclusion: job.conclusion,
+        failedSteps: (job.steps ?? []).filter((step) => step.conclusion === "failure").map((step) => step.name)
+      }))
+      .filter((job) => job.conclusion === "failure" || job.failedSteps.length > 0)
+  } catch (_error) {
+    return null
+  }
+}
+
+async function createDeployFailureIssue({ issueRepoSlug, payload, getConfiguredToken, runGhCommand }) {
+  const tokenOptions = { getConfiguredToken }
+  const title = buildDeployFailureIssueTitle(payload)
+  const body = buildDeployFailureIssueBody(payload)
+
+  if (canUseGithubApi(tokenOptions)) {
+    try {
+      const apiConfig = parseOwnerRepoSlug(issueRepoSlug)
+      const response = await githubApiRequest(
+        "POST",
+        buildRepoApiPath(apiConfig, "/issues"),
+        { title, body },
+        getGithubToken(tokenOptions),
+        apiConfig
+      )
+
+      if (response.ok) {
+        return {
+          ok: true,
+          transport: "github-api",
+          issueNumber: response.body?.number,
+          issueUrl: response.body?.html_url
+        }
+      }
+
+      return {
+        ok: false,
+        error: response.body?.message || `GitHub API issue create failed with status ${response.statusCode}.`
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : "Failed to create deploy failure issue via GitHub API."
+      }
+    }
+  }
+
+  if (canUseGithubCli() && typeof runGhCommand === "function") {
+    const result = runGhCommand(
+      ["issue", "create", "--repo", issueRepoSlug, "--title", title, "--body", body],
+      process.cwd()
+    )
+
+    if (result.status === 0) {
+      const issueUrl = String(result.stdout ?? "")
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => /^https?:\/\//i.test(line))
+
+      return {
+        ok: true,
+        transport: "gh",
+        issueUrl: issueUrl || null
+      }
+    }
+
+    return {
+      ok: false,
+      error: previewCommandOutput(result.stdout, result.stderr, "Failed to create deploy failure issue via gh.")
+    }
+  }
+
+  return {
+    ok: false,
+    error: "Configure pacvueDeploy.githubToken or install official GitHub CLI to create deploy failure issues."
+  }
+}
+
 module.exports = {
+  buildDeployFailureIssueBody,
+  buildDeployFailureIssueTitle,
+  buildGithubFilesIssueSection,
   buildDispatchInputs,
   buildGithubApiDispatchPreview,
   cancelWorkflowRun,
+  createDeployFailureIssue,
   cancelWorkflowRunViaApi,
   canUseGithubApi,
   canUseGithubCli,
@@ -817,6 +1087,7 @@ module.exports = {
   getGithubAuthSummary,
   getGithubToken,
   getLastSuccessfulRunInputs,
+  getWorkflowRunJobsSummary,
   getLatestWorkflowRunViaApi,
   getLatestWorkflowRunViaGh,
   getMissingGithubAuthPayload,
@@ -824,6 +1095,7 @@ module.exports = {
   mapGhRun,
   normalizeWorkflowFileForApi,
   parseGithubRemoteUrl,
+  parseOwnerRepoSlug,
   parseJsonArrayOutput,
   queryLatestWorkflowRun,
   queryLatestWorkflowRunViaApiWithRepo,

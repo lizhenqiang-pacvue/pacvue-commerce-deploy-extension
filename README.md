@@ -9,6 +9,7 @@
 - 根据 workflow inputs 动态生成表单
 - 触发发版并展示命令与结果
 - 约每分钟轮询 GitHub Actions 状态，支持取消进行中的 run
+- 发版失败时自动在扩展仓库创建 GitHub Issue（含 run URL、失败 job 摘要，供 Agent 排查）
 
 ## 环境要求
 
@@ -63,8 +64,22 @@ Cursor / VS Code：**Extensions: Install from VSIX...** → 选择生成的 `pac
 | 设置 | 说明 |
 |------|------|
 | `pacvueDeploy.githubToken` | 无官方 `gh` 或 Windows 上 `gh` 不可靠时推荐；配置后轮询优先走 GitHub API |
+| `pacvueDeploy.createIssueOnFailure` | 发版触发失败或 workflow run 失败时，自动在扩展仓库创建 Issue（默认 `true`） |
+| `pacvueDeploy.issueRepo` | Issue 目标仓库，格式 `owner/repo`；留空则使用扩展 `package.json` 中的 repository |
 
 也可使用环境变量 `GITHUB_TOKEN` / `GH_TOKEN`（需能被 Cursor 进程读取）。
+
+### 自动 Issue（Agent 排查）
+
+触发失败或 Actions run 失败（非 cancelled）时，扩展会在 [扩展仓库 Issues](https://github.com/lizhenqiang-pacvue/pacvue-commerce-deploy-extension/issues) 创建标题以 `[auto-triage]` 开头的 Issue，内容包括：
+
+- Commerce 仓库、workflow、目标分支
+- GitHub Actions Run URL
+- 失败 job / step 摘要
+- 当前 Commerce 项目 `.github` 目录下的 CI 配置原文（workflow 优先展示，便于 Agent 对照各项目不规范配置）
+- 结构化 JSON payload（供后续 Agent 读取）
+
+同一 `runId` 只会创建一次 Issue。Token 需具备扩展仓库的 `repo` 权限（创建 Issue）。
 
 ## 命令行验证（可选）
 

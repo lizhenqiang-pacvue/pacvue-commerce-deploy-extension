@@ -2,9 +2,13 @@
   "name": "pacvue-commerce-deploy-visual",
   "displayName": "Pacvue Commerce Deploy",
   "description": "Visual Cursor and VS Code sidebar for Pacvue commerce test deployments.",
-  "version": "0.3.9",
+  "version": "0.3.11",
   "publisher": "pacvue",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lizhenqiang-pacvue/pacvue-commerce-deploy-extension.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -43,6 +47,16 @@
           "type": "string",
           "default": "",
           "markdownDescription": "GitHub Personal Access Token used when GitHub CLI (`gh`) is not installed, and preferred for workflow status polling/cancel when set (more reliable on Windows). Requires `repo` and `workflow` scopes. You can also set `GITHUB_TOKEN` or `GH_TOKEN` in the environment."
+        },
+        "pacvueDeploy.createIssueOnFailure": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a deploy trigger or workflow run fails, automatically create a GitHub Issue in the extension repository for agent triage."
+        },
+        "pacvueDeploy.issueRepo": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "GitHub repository (`owner/repo`) where deploy failure issues are created. Defaults to this extension's repository from package.json."
         }
       }
     }

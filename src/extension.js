@@ -4,7 +4,11 @@ const path = require("node:path")
 const vscode = require("vscode")
 const {
   cancelWorkflowRun,
+  createDeployFailureIssue,
   getGithubAuthSummary,
+  getGithubRepoInfo,
+  getWorkflowRunJobsSummary,
+  hasGithubAuth,
   queryLatestWorkflowRun
 } = require("../scripts/github-api")
 
@@ -132,6 +136,16 @@ class DeployViewProvider {
         command
       }
     })
+
+    if (action === "dispatch" && !ok) {
+      void this.reportDeployFailure({
+        failureType: "trigger",
+        workspaceRoot,
+        parsed,
+        command,
+        message: [parsed?.reason, ...(Array.isArray(parsed?.remediation) ? parsed.remediation : [])].filter(Boolean).join("\n") || result.stderr || result.stdout
+      })
+    }
   }
 
   startRunStatusPolling(webviewView, workspaceRoot, parsed, command) {
@@ -195,6 +209,18 @@ class DeployViewProvider {
             message: getCompletedRunMessage(state)
           }
         })
+
+        if (state === "failed") {
+          void this.reportDeployFailure({
+            failureType: "run",
+            workspaceRoot,
+            parsed,
+            command,
+            run,
+            conclusion: run.conclusion,
+            message: getCompletedRunMessage(state)
+          })
+        }
         return
       }
 
@@ -290,6 +316,82 @@ class DeployViewProvider {
           : cancelResult.error || "Failed to cancel workflow run."
       }
     })
+  }
+
+  async reportDeployFailure(details) {
+    const config = vscode.workspace.getConfiguration("pacvueDeploy")
+    if (!config.get("createIssueOnFailure", true)) {
+      return null
+    }
+
+    const transportOptions = getGithubTransportOptions()
+    if (!hasGithubAuth(transportOptions)) {
+      return null
+    }
+
+    const runId = details.run?.databaseId
+    if (runId) {
+      const reportedRunIds = this.context.globalState.get("reportedDeployFailureRunIds", [])
+      if (reportedRunIds.includes(runId)) {
+        return null
+      }
+    }
+
+    const issueRepo = String(config.get("issueRepo") ?? "").trim() || getIssueRepoFromPackage(this.context)
+    if (!issueRepo) {
+      return null
+    }
+
+    const commerceRepo = getCommerceRepoSlug(details.workspaceRoot, transportOptions)
+    const githubSnapshot = collectGithubDirectorySnapshot(details.workspaceRoot, {
+      priorityWorkflowFile: details.parsed?.workflow?.file
+    })
+    let jobsSummary = null
+
+    if (runId && details.workspaceRoot) {
+      jobsSummary = await getWorkflowRunJobsSummary({
+        repoRoot: details.workspaceRoot,
+        runId,
+        getConfiguredToken: transportOptions.getConfiguredToken,
+        runGit: (repoRoot, args) => runGitCommand(args, repoRoot).stdout.trim()
+      })
+    }
+
+    const result = await createDeployFailureIssue({
+      issueRepoSlug: issueRepo,
+      payload: {
+        ...details,
+        commerceRepo,
+        githubSnapshot,
+        jobsSummary,
+        extensionVersion: this.context.extension.packageJSON?.version ?? null
+      },
+      getConfiguredToken: transportOptions.getConfiguredToken,
+      runGhCommand: (args, cwd) => runCommand("gh", args, cwd)
+    })
+
+    if (!result.ok) {
+      return result
+    }
+
+    if (runId) {
+      const reportedRunIds = this.context.globalState.get("reportedDeployFailureRunIds", [])
+      await this.context.globalState.update("reportedDeployFailureRunIds", [...reportedRunIds.filter((id) => id !== runId).slice(-99), runId])
+    }
+
+    if (result.issueUrl) {
+      const openAction = "Open Issue"
+      const selection = await vscode.window.showInformationMessage(
+        `Deploy failure reported as GitHub issue${result.issueNumber ? ` #${result.issueNumber}` : ""} in ${issueRepo}.`,
+        openAction
+      )
+
+      if (selection === openAction) {
+        await vscode.env.openExternal(vscode.Uri.parse(result.issueUrl))
+      }
+    }
+
+    return result
   }
 
   getHtml(webview) {
@@ -873,6 +975,177 @@ function getGithubTransportOptions() {
     getConfiguredToken: () => vscode.workspace.getConfiguration("pacvueDeploy").get("githubToken"),
     runGit: (repoRoot, args) => runGitCommand(args, repoRoot).stdout.trim(),
     runGhCommand: (args, cwd) => runCommand("gh", args, cwd)
+  }
+}
+
+function getIssueRepoFromPackage(context) {
+  const repository = context.extension.packageJSON?.repository
+  const repositoryUrl = typeof repository === "string" ? repository : repository?.url
+  if (!repositoryUrl) {
+    return ""
+  }
+
+  const match = String(repositoryUrl).match(/github\.com[:/]([^/]+)\/([^/.]+)/i)
+  return match ? `${match[1]}/${match[2]}` : ""
+}
+
+function getCommerceRepoSlug(workspaceRoot, transportOptions) {
+  if (!workspaceRoot) {
+    return "unknown"
+  }
+
+  try {
+    const repo = getGithubRepoInfo(workspaceRoot, transportOptions.runGit)
+    return `${repo.owner}/${repo.repo}`
+  } catch (_error) {
+    return workspaceRoot
+  }
+}
+
+const GITHUB_SNAPSHOT_TEXT_EXTENSIONS = new Set([".yml", ".yaml", ".json", ".md", ".sh", ".txt", ".xml", ".properties"])
+
+function normalizeGithubSnapshotPath(filePath) {
+  return String(filePath ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+}
+
+function isLikelyGithubTextFile(filePath) {
+  const extension = path.extname(filePath).toLowerCase()
+  return GITHUB_SNAPSHOT_TEXT_EXTENSIONS.has(extension)
+}
+
+function collectGithubDirectorySnapshot(workspaceRoot, options = {}) {
+  if (!workspaceRoot) {
+    return { missing: true, files: [], totalDiscovered: 0 }
+  }
+
+  const githubDir = path.join(workspaceRoot, ".github")
+  if (!fs.existsSync(githubDir)) {
+    return { missing: true, files: [], totalDiscovered: 0 }
+  }
+
+  const discovered = []
+
+  const walk = (directory) => {
+    for (const entryName of fs.readdirSync(directory)) {
+      const fullPath = path.join(directory, entryName)
+      const stats = fs.statSync(fullPath)
+
+      if (stats.isDirectory()) {
+        walk(fullPath)
+        continue
+      }
+
+      if (!stats.isFile()) {
+        continue
+      }
+
+      discovered.push({
+        fullPath,
+        path: normalizeGithubSnapshotPath(path.relative(workspaceRoot, fullPath)),
+        size: stats.size
+      })
+    }
+  }
+
+  walk(githubDir)
+
+  const priorityWorkflow = normalizeGithubSnapshotPath(options.priorityWorkflowFile)
+  const priorityWorkflowBase = priorityWorkflow ? path.basename(priorityWorkflow) : ""
+  const rankEntry = (entry) => {
+    if (
+      priorityWorkflow &&
+      (entry.path === priorityWorkflow || path.basename(entry.path) === priorityWorkflowBase)
+    ) {
+      return 0
+    }
+
+    if (entry.path.startsWith(".github/workflows/")) {
+      return 1
+    }
+
+    return 2
+  }
+
+  discovered.sort((left, right) => {
+    const rankDiff = rankEntry(left) - rankEntry(right)
+    return rankDiff !== 0 ? rankDiff : left.path.localeCompare(right.path)
+  })
+
+  const maxFiles = 40
+  const maxFileChars = 12000
+  const maxSectionChars = 45000
+  const maxFileBytes = 200 * 1024
+  const files = []
+  let totalChars = 0
+
+  for (const entry of discovered) {
+    if (files.length >= maxFiles) {
+      break
+    }
+
+    if (!isLikelyGithubTextFile(entry.fullPath)) {
+      files.push({
+        path: entry.path,
+        content: null,
+        skipped: "unsupported file type",
+        size: entry.size
+      })
+      continue
+    }
+
+    if (entry.size > maxFileBytes) {
+      files.push({
+        path: entry.path,
+        content: null,
+        skipped: "file too large",
+        size: entry.size
+      })
+      continue
+    }
+
+    let content = fs.readFileSync(entry.fullPath, "utf8")
+    if (content.includes("\u0000")) {
+      files.push({
+        path: entry.path,
+        content: null,
+        skipped: "binary file",
+        size: entry.size
+      })
+      continue
+    }
+
+    let truncated = false
+    if (content.length > maxFileChars) {
+      content = `${content.slice(0, maxFileChars)}\n... (truncated)`
+      truncated = true
+    }
+
+    if (totalChars + content.length > maxSectionChars) {
+      files.push({
+        path: entry.path,
+        content: null,
+        skipped: "issue body size limit",
+        size: entry.size
+      })
+      break
+    }
+
+    totalChars += content.length
+    files.push({
+      path: entry.path,
+      content,
+      truncated,
+      size: entry.size
+    })
+  }
+
+  return {
+    missing: false,
+    files,
+    totalDiscovered: discovered.length
   }
 }
 
