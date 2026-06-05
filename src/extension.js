@@ -1,0 +1,975 @@
+const childProcess = require("node:child_process")
+const fs = require("node:fs")
+const path = require("node:path")
+const vscode = require("vscode")
+const {
+  cancelWorkflowRun,
+  getGithubAuthSummary,
+  queryLatestWorkflowRun
+} = require("../scripts/github-api")
+
+const VIEW_ID = "pacvueCommerceDeployView"
+const RUN_STATUS_POLL_INTERVAL_MS = 60 * 1000
+
+function activate(context) {
+  const provider = new DeployViewProvider(context)
+
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider(VIEW_ID, provider, { webviewOptions: { retainContextWhenHidden: true } }))
+  context.subscriptions.push(vscode.commands.registerCommand("pacvueDeploy.focus", () => vscode.commands.executeCommand("workbench.view.extension.pacvueDeploy")))
+}
+
+function deactivate() {}
+
+class DeployViewProvider {
+  constructor(context) {
+    this.context = context
+    this.pollTimer = null
+    this.activeRun = null
+  }
+
+  resolveWebviewView(webviewView) {
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")]
+    }
+    webviewView.webview.html = this.getHtml(webviewView.webview)
+
+    webviewView.webview.onDidReceiveMessage(async (message) => {
+      if (message.type === "ready") {
+        await this.postInitialState(webviewView)
+        return
+      }
+
+      if (message.type === "dryRun" || message.type === "dispatch") {
+        await this.runDeployCommand(webviewView, message.type, message.payload)
+        return
+      }
+
+      if (message.type === "cancel") {
+        await this.cancelDeployCommand(webviewView)
+      }
+    })
+  }
+
+  async postInitialState(webviewView) {
+    const workspaceRoot = getWorkspaceRoot()
+    const branchResult = workspaceRoot
+      ? await getBranchOptions(workspaceRoot)
+      : buildEmptyBranchResult("Open a folder workspace to load Git branches.", buildBranchDiagnosis({ workspaceRoot: null }))
+    const currentBranch = branchResult.currentBranch || ""
+    const scriptPath = workspaceRoot ? findDeployScript(workspaceRoot, this.context.extensionPath) : null
+    const workflowMetadata = workspaceRoot && scriptPath ? getWorkflowMetadata(scriptPath, workspaceRoot) : { workflows: [], error: null }
+
+    webviewView.webview.postMessage({
+      type: "state",
+      payload: {
+        workspaceRoot,
+        currentBranch,
+        branchOptions: branchResult.branches,
+        branchError: branchResult.error,
+        branchDebug: branchResult.debug ?? null,
+        branchDiagnosis: branchResult.diagnosis ?? null,
+        scriptPath,
+        workflows: workflowMetadata.workflows,
+        workflowError: workflowMetadata.error,
+        githubAuth: getGithubAuthSummary(getGithubTransportOptions())
+      }
+    })
+  }
+
+  async runDeployCommand(webviewView, action, form) {
+    const workspaceRoot = getWorkspaceRoot()
+    if (!workspaceRoot) {
+      webviewView.webview.postMessage({ type: "result", payload: { ok: false, error: "Open a Pacvue commerce workspace before deploying." } })
+      return
+    }
+
+    const scriptPath = findDeployScript(workspaceRoot, this.context.extensionPath)
+    if (!scriptPath) {
+      webviewView.webview.postMessage({
+        type: "result",
+        payload: {
+          ok: false,
+          error: "Could not find pacvue-commerce-deploy-plugin/scripts/deploy-to-test.js in this workspace."
+        }
+      })
+      return
+    }
+
+    const args = buildScriptArgs(scriptPath, form, action)
+    webviewView.webview.postMessage({ type: "running", payload: { action, command: ["node", ...args].join(" ") } })
+
+    const result = runCommand("node", args, workspaceRoot)
+    const parsed = enrichDeployParsedResult(parseJsonOutput(result.stdout), form)
+    const ok = result.status === 0 && (parsed?.ok ?? true)
+    const command = ["node", ...args].join(" ")
+
+    if (action === "dispatch" && ok) {
+      webviewView.webview.postMessage({
+        type: "runStatus",
+        payload: {
+          state: "in_progress",
+          status: "queued",
+          conclusion: null,
+          parsed,
+          command,
+          message: "Deploy workflow is in progress. Next status check runs in 1 minute."
+        }
+      })
+      this.startRunStatusPolling(webviewView, workspaceRoot, parsed, command)
+      return
+    }
+
+    webviewView.webview.postMessage({
+      type: "result",
+      payload: {
+        ok,
+        status: result.status,
+        action,
+        parsed,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        command
+      }
+    })
+  }
+
+  startRunStatusPolling(webviewView, workspaceRoot, parsed, command) {
+    this.stopRunStatusPolling()
+
+    const workflowFile = normalizeWorkflowFileForGh(parsed?.workflow?.file)
+    const targetBranch = parsed?.targetBranch
+    if (!workflowFile || !targetBranch) {
+      webviewView.webview.postMessage({
+        type: "runStatus",
+        payload: {
+          state: "unknown",
+          status: "unknown",
+          conclusion: null,
+          parsed,
+          command,
+          message: "Workflow was triggered, but run status cannot be polled because workflow or branch metadata is missing."
+        }
+      })
+      return
+    }
+
+    this.activeRun = {
+      workspaceRoot,
+      workflowFile,
+      targetBranch,
+      parsed,
+      command
+    }
+
+    const poll = async () => {
+      const run = await getLatestWorkflowRunWithFallback(workspaceRoot, workflowFile, targetBranch)
+      if (!run.ok) {
+        webviewView.webview.postMessage({
+          type: "runStatus",
+          payload: {
+            state: "in_progress",
+            status: "polling",
+            conclusion: null,
+            parsed,
+            command,
+            message: run.error || "Workflow is still in progress. Next status check runs in 1 minute."
+          }
+        })
+        return
+      }
+
+      if (!isWorkflowRunInProgress(run.status)) {
+        this.stopRunStatusPolling()
+        const state = getCompletedRunState(run)
+
+        webviewView.webview.postMessage({
+          type: "runStatus",
+          payload: {
+            state,
+            status: run.status,
+            conclusion: run.conclusion,
+            run,
+            parsed,
+            command,
+            message: getCompletedRunMessage(state)
+          }
+        })
+        return
+      }
+
+      webviewView.webview.postMessage({
+        type: "runStatus",
+        payload: {
+          state: "in_progress",
+          status: run.status,
+          conclusion: run.conclusion,
+          run,
+          parsed,
+          command,
+          message: "Deploy workflow is still in progress. Next status check runs in 1 minute."
+        }
+      })
+    }
+
+    void poll()
+    this.pollTimer = setInterval(() => {
+      void poll()
+    }, RUN_STATUS_POLL_INTERVAL_MS)
+  }
+
+  stopRunStatusPolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = null
+    }
+    this.activeRun = null
+  }
+
+  async cancelDeployCommand(webviewView) {
+    if (!this.activeRun) {
+      webviewView.webview.postMessage({
+        type: "runStatus",
+        payload: {
+          state: "failed",
+          status: "cancel_failed",
+          conclusion: "failure",
+          message: "No in-progress deploy workflow is available to cancel."
+        }
+      })
+      return
+    }
+
+    const { workspaceRoot, workflowFile, targetBranch, parsed, command } = this.activeRun
+    const run = await getLatestWorkflowRunWithFallback(workspaceRoot, workflowFile, targetBranch)
+    if (!run.ok) {
+      webviewView.webview.postMessage({
+        type: "runStatus",
+        payload: {
+          state: "in_progress",
+          status: "cancel_pending",
+          conclusion: null,
+          parsed,
+          command,
+          message: run.error || "Could not find workflow run to cancel yet. Polling will continue."
+        }
+      })
+      return
+    }
+
+    if (!isWorkflowRunInProgress(run.status)) {
+      this.stopRunStatusPolling()
+      const state = getCompletedRunState(run)
+      webviewView.webview.postMessage({
+        type: "runStatus",
+        payload: {
+          state,
+          status: run.status,
+          conclusion: run.conclusion,
+          run,
+          parsed,
+          command,
+          message: getCompletedRunMessage(state)
+        }
+      })
+      return
+    }
+
+    const cancelResult = await cancelWorkflowRunWithFallback(workspaceRoot, run.databaseId)
+    webviewView.webview.postMessage({
+      type: "runStatus",
+      payload: {
+        state: "in_progress",
+        status: cancelResult.ok ? "cancelling" : "cancel_failed",
+        conclusion: null,
+        run,
+        parsed,
+        command,
+        message: cancelResult.ok
+          ? "Cancel requested. Polling will continue until GitHub reports a final status."
+          : cancelResult.error || "Failed to cancel workflow run."
+      }
+    })
+  }
+
+  getHtml(webview) {
+    const nonce = createNonce()
+    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.js"))
+    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "styles.css"))
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+  <link rel="stylesheet" href="${styleUri}">
+  <title>Pacvue Commerce Deploy</title>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Pacvue Commerce</p>
+        <h1>Deploy</h1>
+      </div>
+      <span class="status-pill" id="statusPill">Idle</span>
+    </section>
+
+    <details class="panel help-panel">
+      <summary>使用说明</summary>
+      <ol>
+        <li>在 Pacvue Commerce 仓库根目录打开本面板，选择 <strong>Target branch</strong> 与 <strong>Workflow</strong>（名称含「测试环境发版」）。</li>
+        <li>填写 workflow 动态参数（如 ProjectName、environment、buildcmd），点击 <strong>Run</strong> 触发 GitHub Actions。</li>
+        <li>发版后约每分钟轮询一次状态；进行中可点 <strong>Cancel</strong>。结果区可复制命令与 Run URL。</li>
+        <li><strong>方式 A — 无 GitHub CLI</strong>：在设置中配置 <code>pacvueDeploy.githubToken</code> 或环境变量 <code>GITHUB_TOKEN</code>（<code>repo</code> + <code>workflow</code>），Reload Window。发版、轮询、取消均走 GitHub API。</li>
+        <li><strong>方式 B — 有官方 GitHub CLI</strong>：安装 <code>gh</code> 并执行 <code>gh auth login</code>。发版与轮询走 <code>gh</code>；若同时配置了 Token，轮询优先 API。</li>
+        <li><strong>Windows 注意</strong>：Volta/npm 的 <code>gh</code> 不是官方 CLI；无官方 gh 时请用方式 A。</li>
+      </ol>
+      <p class="help-foot">更多说明见扩展目录 README.md；发版前可用命令行 <code>--dry-run</code> 预览。</p>
+    </details>
+
+    <section class="panel">
+      <label>
+        <span>Target branch</span>
+        <select id="branch">
+          <option value="">Loading branches...</option>
+        </select>
+      </label>
+
+      <label>
+        <span>Workflow</span>
+        <select id="workflow">
+          <option value="">Loading workflows...</option>
+        </select>
+      </label>
+
+      <div id="dynamicInputs" class="grid"></div>
+
+      <div class="actions">
+        <button id="runButton">Run</button>
+        <button id="cancelButton" class="danger" disabled>Cancel</button>
+      </div>
+    </section>
+
+    <section class="output" aria-live="polite">
+      <div class="output-header">
+        <span>Result</span>
+        <button id="copyButton">Copy</button>
+      </div>
+      <pre id="output">Click Run to trigger the selected GitHub Actions workflow.</pre>
+    </section>
+  </main>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
+</body>
+</html>`
+  }
+}
+
+function buildScriptArgs(scriptPath, form, action) {
+  const args = [
+    scriptPath,
+    "--branch",
+    form.branch,
+    "--skip-last-run-inputs"
+  ]
+
+  if (form.workflow) {
+    args.push("--workflow", form.workflow)
+  }
+
+  for (const [key, value] of Object.entries(form.inputs || {})) {
+    if (value === "") continue
+    args.push("--input", `${key}=${value}`)
+  }
+
+  args.push(action === "dispatch" ? "--dispatch" : "--dry-run")
+  return args
+}
+
+function getWorkspaceRoot() {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null
+}
+
+function findDeployScript(workspaceRoot, extensionRoot) {
+  const candidates = [
+    path.join(workspaceRoot, "pacvue-commerce-deploy-plugin", "scripts", "deploy-to-test.js"),
+    path.resolve(extensionRoot, "..", "pacvue-commerce-deploy-plugin", "scripts", "deploy-to-test.js"),
+    path.join(extensionRoot, "scripts", "deploy-to-test.js")
+  ]
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? null
+}
+
+function getWorkflowMetadata(scriptPath, workspaceRoot) {
+  const result = runCommand("node", [scriptPath, "--list-workflows-json"], workspaceRoot)
+  const parsed = parseJsonOutput(result.stdout)
+
+  return {
+    workflows: Array.isArray(parsed?.workflows) ? parsed.workflows : [],
+    error: result.status === 0 ? null : result.stderr || parsed?.reason || "No Pacvue test deploy workflows were found."
+  }
+}
+
+function getGitExecutable() {
+  const configuredPath = vscode.workspace.getConfiguration("git").get("path")
+  if (configuredPath && fs.existsSync(configuredPath)) {
+    return configuredPath
+  }
+
+  if (process.platform === "win32") {
+    const candidates = [
+      path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "cmd", "git.exe"),
+      path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Git", "cmd", "git.exe"),
+      path.join(process.env.LocalAppData || "", "Programs", "Git", "cmd", "git.exe")
+    ]
+    const existing = candidates.find((candidate) => candidate && fs.existsSync(candidate))
+    if (existing) return existing
+  }
+
+  return "git"
+}
+
+function applyGithubTokenToEnv(env) {
+  if (String(env.GITHUB_TOKEN ?? "").trim() || String(env.GH_TOKEN ?? "").trim()) {
+    return env
+  }
+
+  const configuredToken = String(vscode.workspace.getConfiguration("pacvueDeploy").get("githubToken") ?? "").trim()
+  if (configuredToken) {
+    env.GITHUB_TOKEN = configuredToken
+  }
+
+  return env
+}
+
+function getCommandEnv() {
+  const env = applyGithubTokenToEnv({ ...process.env })
+
+  if (process.platform !== "win32") {
+    return env
+  }
+
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") || "Path"
+  const extraPaths = [
+    path.join(process.env.ProgramFiles || "C:\\Program Files", "Git", "cmd"),
+    path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Git", "cmd"),
+    path.join(process.env.LocalAppData || "", "Programs", "Git", "cmd")
+  ].filter((entry) => entry && fs.existsSync(entry))
+
+  env[pathKey] = [...extraPaths, env[pathKey] || ""].filter(Boolean).join(path.delimiter)
+  return env
+}
+
+function runGitCommand(args, cwd) {
+  return runCommand(getGitExecutable(), args, cwd)
+}
+
+function splitCommandOutput(stdout) {
+  return String(stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\r$/, "").trim())
+    .filter(Boolean)
+}
+
+function normalizeBranchName(branch) {
+  return branch
+    .replace(/^\*\s+/, "")
+    .replace(/^remotes\//, "")
+    .replace(/^origin\//, "")
+    .trim()
+}
+
+function isValidBranchName(branch) {
+  return Boolean(branch) && branch !== "HEAD" && branch !== "origin/HEAD" && !branch.includes("HEAD ->")
+}
+
+function parsePlainBranchOutput(stdout) {
+  return splitCommandOutput(stdout).map(normalizeBranchName).filter(isValidBranchName)
+}
+
+function normalizeFsPath(value) {
+  return path.normalize(String(value ?? "")).toLowerCase()
+}
+
+function findGitRepository(gitApi, workspaceRoot) {
+  if (!gitApi?.repositories?.length) {
+    return null
+  }
+
+  const normalizedRoot = normalizeFsPath(workspaceRoot)
+  return (
+    gitApi.repositories.find((repo) => {
+      const repoRoot = normalizeFsPath(repo.rootUri.fsPath)
+      return normalizedRoot === repoRoot || normalizedRoot.startsWith(`${repoRoot}${path.sep}`)
+    }) || gitApi.repositories[0]
+  )
+}
+
+function collectBranchNamesFromRefs(refs = []) {
+  const branches = new Set()
+
+  for (const ref of refs) {
+    const normalized = normalizeBranchName(String(ref?.name ?? ""))
+    if (isValidBranchName(normalized)) {
+      branches.add(normalized)
+    }
+  }
+
+  return branches
+}
+
+function buildEmptyBranchResult(error, diagnosis) {
+  return {
+    branches: [],
+    currentBranch: "",
+    error,
+    debug: diagnosis?.technicalDetails ?? null,
+    diagnosis
+  }
+}
+
+function inspectGitWorkspace(workspaceRoot) {
+  const git = getGitExecutable()
+  const insideWorkTree = runGitCommand(["rev-parse", "--is-inside-work-tree"], workspaceRoot)
+  const topLevel = runGitCommand(["rev-parse", "--show-toplevel"], workspaceRoot)
+  const showCurrent = runGitCommand(["branch", "--show-current"], workspaceRoot)
+
+  return {
+    gitExecutable: git,
+    gitExecutableExists: git === "git" ? null : fs.existsSync(git),
+    isInsideWorkTree: insideWorkTree.status === 0 ? insideWorkTree.stdout.trim() : null,
+    topLevel: topLevel.status === 0 ? topLevel.stdout.trim() : null,
+    topLevelError: topLevel.status !== 0 ? (topLevel.stderr || topLevel.stdout).trim() : null,
+    currentBranch: showCurrent.status === 0 ? showCurrent.stdout.trim() : null,
+    currentBranchError: showCurrent.status !== 0 ? (showCurrent.stderr || showCurrent.stdout).trim() : null
+  }
+}
+
+function buildBranchDiagnosis({ workspaceRoot, gitApiResult = null, spawnResult = null, gitInspect = null }) {
+  const checks = []
+  const suggestions = []
+  let reason = "未能加载 Git 分支列表。"
+  let category = "unknown"
+
+  if (!workspaceRoot) {
+    return {
+      reason: "未打开文件夹工作区，扩展无法读取 Git 分支。",
+      category: "no-workspace",
+      checks: ["工作区路径: (empty)"],
+      suggestions: [
+        "使用 File > Open Folder 打开 Pacvue Commerce 仓库根目录（包含 .git 的目录）。",
+        "不要只打开单个文件；需要打开整个仓库文件夹。",
+        "打开后重新加载窗口，再打开 Pacvue Deploy 面板。"
+      ],
+      technicalDetails: { workspaceRoot: null }
+    }
+  }
+
+  checks.push(`工作区路径: ${workspaceRoot}`)
+
+  if (gitInspect) {
+    checks.push(`Git 可执行文件: ${gitInspect.gitExecutable}`)
+    if (gitInspect.gitExecutableExists === false) {
+      checks.push("Git 可执行文件是否存在: false")
+    }
+    checks.push(`git rev-parse --is-inside-work-tree: ${gitInspect.isInsideWorkTree ?? "failed"}`)
+    checks.push(`git rev-parse --show-toplevel: ${gitInspect.topLevel ?? gitInspect.topLevelError ?? "failed"}`)
+    checks.push(`git branch --show-current: ${gitInspect.currentBranch ?? gitInspect.currentBranchError ?? "failed"}`)
+  }
+
+  const gitApiDebug = gitApiResult?.debug ?? null
+  const gitSpawnDebug = spawnResult?.debug ?? null
+
+  if (gitApiDebug) {
+    checks.push(`VS Code Git API 来源: ${gitApiDebug.source ?? "git-api"}`)
+    if (typeof gitApiDebug.repositoryCount === "number") {
+      checks.push(`VS Code Git 扩展检测到的仓库数: ${gitApiDebug.repositoryCount}`)
+    }
+    if (gitApiDebug.repositoryRoot) {
+      checks.push(`VS Code Git 仓库根目录: ${gitApiDebug.repositoryRoot}`)
+    }
+    if (typeof gitApiDebug.localRefCount === "number") {
+      checks.push(`VS Code Git 本地分支数: ${gitApiDebug.localRefCount}`)
+    }
+    if (typeof gitApiDebug.remoteRefCount === "number") {
+      checks.push(`VS Code Git 远程分支数: ${gitApiDebug.remoteRefCount}`)
+    }
+  } else if (gitApiResult === null) {
+    checks.push("VS Code Git 扩展: 未找到 (vscode.git)")
+  }
+
+  if (gitSpawnDebug) {
+    checks.push(`Git 命令来源: ${gitSpawnDebug.source ?? "git-spawn"}`)
+    if (typeof gitSpawnDebug.forEachRefStatus === "number") {
+      checks.push(`git for-each-ref 退出码: ${gitSpawnDebug.forEachRefStatus}`)
+    }
+    if (gitSpawnDebug.forEachRefStderr) {
+      checks.push(`git for-each-ref 错误: ${gitSpawnDebug.forEachRefStderr}`)
+    }
+    if (typeof gitSpawnDebug.forEachRefStdoutLength === "number") {
+      checks.push(`git for-each-ref 输出长度: ${gitSpawnDebug.forEachRefStdoutLength}`)
+    }
+    if (typeof gitSpawnDebug.localStatus === "number") {
+      checks.push(`git branch --list 退出码: ${gitSpawnDebug.localStatus}`)
+    }
+    if (typeof gitSpawnDebug.remoteStatus === "number") {
+      checks.push(`git branch -r --list 退出码: ${gitSpawnDebug.remoteStatus}`)
+    }
+    if (gitSpawnDebug.localStderr) {
+      checks.push(`git branch --list 错误: ${gitSpawnDebug.localStderr}`)
+    }
+    if (gitSpawnDebug.remoteStderr) {
+      checks.push(`git branch -r --list 错误: ${gitSpawnDebug.remoteStderr}`)
+    }
+  }
+
+  const repositoryRoot = gitApiDebug?.repositoryRoot ?? gitInspect?.topLevel ?? null
+  if (repositoryRoot && normalizeFsPath(repositoryRoot) !== normalizeFsPath(workspaceRoot)) {
+    category = "workspace-mismatch"
+    reason = "当前打开的文件夹与 Git 仓库根目录不一致，可能导致分支列表为空。"
+    suggestions.push(`请改为打开 Git 仓库根目录: ${repositoryRoot}`)
+    suggestions.push("在集成终端执行 git rev-parse --show-toplevel，确认路径与 VS Code 打开的工作区一致。")
+  } else if (gitApiResult === null) {
+    category = "git-extension-missing"
+    reason = "未找到 VS Code 内置 Git 扩展，且 Git 命令 fallback 也未能读取分支。"
+    suggestions.push("确认 Cursor / VS Code 已启用 Git 相关功能。")
+    suggestions.push("Windows 可在设置 git.path 指向 git.exe，例如 C:\\Program Files\\Git\\cmd\\git.exe")
+  } else if (gitApiDebug && typeof gitApiDebug.repositoryCount === "number" && gitApiDebug.repositoryCount === 0) {
+    category = "no-git-repo"
+    reason = "VS Code Git 扩展未识别当前工作区为 Git 仓库。"
+    suggestions.push("确认打开的是包含 .git 的仓库根目录。")
+    suggestions.push("查看左侧 Source Control 是否显示分支名；若没有，说明 IDE 也未识别此目录为 Git 仓库。")
+  } else if (gitInspect?.isInsideWorkTree !== "true") {
+    category = "not-git-worktree"
+    reason = "当前工作区路径不在 Git 工作树内。"
+    suggestions.push("在集成终端进入仓库根目录后执行 git rev-parse --show-toplevel。")
+    suggestions.push("用 Open Folder 打开该命令输出的目录。")
+  } else if (gitSpawnDebug?.forEachRefStderr || gitSpawnDebug?.localStderr || gitSpawnDebug?.remoteStderr) {
+    const spawnMessage = gitSpawnDebug.forEachRefStderr || gitSpawnDebug.localStderr || gitSpawnDebug.remoteStderr || ""
+    if (/enoent|not found|不是内部或外部命令|cannot find/i.test(spawnMessage)) {
+      category = "git-not-found"
+      reason = "扩展进程无法调用 Git 可执行文件（终端可用但 Extension Host 可能 PATH 不同）。"
+      suggestions.push("在 VS Code / Cursor 设置中配置 git.path 为 git.exe 完整路径。")
+      suggestions.push("配置后 Reload Window，再重新打开 Deploy 面板。")
+    } else {
+      category = "git-command-failed"
+      reason = "Git 命令执行失败，无法读取分支列表。"
+      suggestions.push("在 VS Code 集成终端执行 git branch --list 与 git for-each-ref --format=\"%(refname:short)\" refs/heads refs/remotes/origin 对比结果。")
+    }
+  } else if (gitApiDebug && gitApiDebug.localRefCount === 0 && gitApiDebug.remoteRefCount === 0) {
+    category = "empty-repository"
+    reason = "Git 仓库已识别，但未发现任何本地或远程分支。"
+    suggestions.push("确认仓库已完成 clone 且存在 commits。")
+    suggestions.push("尝试 git fetch --all 后再刷新面板。")
+  } else {
+    category = "empty-branch-list"
+    reason = gitApiResult?.error || spawnResult?.error || "Git 命令与 VS Code Git API 均未返回可用分支。"
+    suggestions.push("在集成终端确认 git branch --list 有输出。")
+    suggestions.push("确认 VS Code 打开的工作区与终端执行命令的目录一致。")
+    suggestions.push("Reload Window 后重试；若仍失败，将下方技术详情发给排查同事。")
+  }
+
+  if (!suggestions.length) {
+    suggestions.push("在集成终端执行 git branch --list，确认分支存在。")
+    suggestions.push("Reload Window 后重新打开 Pacvue Deploy 面板。")
+  }
+
+  return {
+    reason,
+    category,
+    checks,
+    suggestions,
+    technicalDetails: {
+      workspaceRoot,
+      repositoryRoot,
+      gitApiError: gitApiResult?.error ?? null,
+      gitSpawnError: spawnResult?.error ?? null,
+      gitApi: gitApiDebug,
+      gitSpawn: gitSpawnDebug,
+      gitInspect
+    }
+  }
+}
+
+async function getBranchOptionsFromGitApi(workspaceRoot) {
+  const gitExtension = vscode.extensions.getExtension("vscode.git")
+  if (!gitExtension) {
+    return {
+      branches: [],
+      currentBranch: "",
+      error: "VS Code Git extension (vscode.git) is not available.",
+      debug: { source: "git-api", workspaceRoot, gitExtensionAvailable: false }
+    }
+  }
+
+  if (!gitExtension.isActive) {
+    await gitExtension.activate()
+  }
+
+  const gitApi = gitExtension.exports?.getAPI?.(1)
+  const repository = findGitRepository(gitApi, workspaceRoot)
+  if (!repository) {
+    return {
+      branches: [],
+      currentBranch: "",
+      error: "VS Code Git extension did not detect a repository for the open workspace.",
+      debug: { source: "git-api", workspaceRoot, repositoryCount: gitApi?.repositories?.length ?? 0 }
+    }
+  }
+
+  const [localRefs, remoteRefs] = await Promise.all([
+    repository.getBranches({ remote: false }),
+    repository.getBranches({ remote: true })
+  ])
+  const branches = collectBranchNamesFromRefs([...(localRefs ?? []), ...(remoteRefs ?? [])])
+  const currentBranch = normalizeBranchName(repository.state?.HEAD?.name ?? "")
+
+  if (currentBranch && isValidBranchName(currentBranch)) {
+    branches.add(currentBranch)
+  }
+
+  return {
+    branches: [...branches],
+    currentBranch,
+    error: branches.size ? null : "VS Code Git extension returned no branches for this repository.",
+    debug: {
+      source: "git-api",
+      repositoryRoot: repository.rootUri.fsPath,
+      localRefCount: localRefs?.length ?? 0,
+      remoteRefCount: remoteRefs?.length ?? 0
+    }
+  }
+}
+
+function getBranchOptionsFromGitCommand(workspaceRoot, currentBranch = "") {
+  const git = getGitExecutable()
+  const normalizedCurrent = normalizeBranchName(currentBranch)
+  const forEachRefResult = runCommand(
+    git,
+    ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"],
+    workspaceRoot
+  )
+
+  let branchNames = []
+  if (forEachRefResult.status === 0 && forEachRefResult.stdout.trim()) {
+    branchNames = splitCommandOutput(forEachRefResult.stdout).map(normalizeBranchName).filter(isValidBranchName)
+  } else {
+    const localResult = runCommand(git, ["branch", "--list"], workspaceRoot)
+    const remoteResult = runCommand(git, ["branch", "-r", "--list"], workspaceRoot)
+
+    if (localResult.status !== 0 && remoteResult.status !== 0) {
+      const spawnError = localResult.stderr || remoteResult.stderr
+      return {
+        branches: normalizedCurrent ? [normalizedCurrent] : [],
+        currentBranch: normalizedCurrent,
+        error:
+          spawnError ||
+          "Failed to read Git branches. On Windows, install Git for Windows or set the VS Code setting `git.path` to git.exe.",
+        debug: {
+          source: "git-spawn",
+          gitExecutable: git,
+          workspaceRoot,
+          forEachRefStatus: forEachRefResult.status,
+          forEachRefStderr: forEachRefResult.stderr.trim(),
+          forEachRefStdoutLength: forEachRefResult.stdout.length,
+          localStatus: localResult.status,
+          localStderr: localResult.stderr.trim(),
+          remoteStatus: remoteResult.status,
+          remoteStderr: remoteResult.stderr.trim()
+        }
+      }
+    }
+
+    branchNames = [...parsePlainBranchOutput(localResult.stdout), ...parsePlainBranchOutput(remoteResult.stdout)]
+  }
+
+  const resolvedCurrent =
+    normalizedCurrent || normalizeBranchName(runGitCommand(["branch", "--show-current"], workspaceRoot).stdout)
+  const branches = [...new Set([resolvedCurrent, ...branchNames].filter(isValidBranchName))]
+  return {
+    branches,
+    currentBranch: resolvedCurrent,
+    error: branches.length ? null : "No Git branches were found in this workspace.",
+    debug: {
+      source: "git-spawn",
+      gitExecutable: git,
+      workspaceRoot,
+      forEachRefStatus: forEachRefResult.status,
+      forEachRefStderr: forEachRefResult.stderr.trim(),
+      forEachRefStdoutLength: forEachRefResult.stdout.length,
+      localBranchCount: parsePlainBranchOutput(runCommand(git, ["branch", "--list"], workspaceRoot).stdout).length,
+      remoteBranchCount: parsePlainBranchOutput(runCommand(git, ["branch", "-r", "--list"], workspaceRoot).stdout).length,
+      branchCount: branches.length
+    }
+  }
+}
+
+async function getBranchOptions(workspaceRoot) {
+  const gitInspect = inspectGitWorkspace(workspaceRoot)
+  const gitApiResult = await getBranchOptionsFromGitApi(workspaceRoot)
+  if (gitApiResult?.branches?.length) {
+    return gitApiResult
+  }
+
+  const spawnResult = getBranchOptionsFromGitCommand(workspaceRoot, gitApiResult?.currentBranch ?? "")
+  if (spawnResult.branches.length) {
+    return spawnResult
+  }
+
+  const diagnosis = buildBranchDiagnosis({ workspaceRoot, gitApiResult, spawnResult, gitInspect })
+
+  return {
+    branches: [],
+    currentBranch: gitApiResult?.currentBranch || spawnResult.currentBranch || gitInspect.currentBranch || "",
+    error: diagnosis.reason,
+    debug: diagnosis.technicalDetails,
+    diagnosis
+  }
+}
+
+function isWorkflowRunInProgress(status) {
+  return ["queued", "in_progress", "waiting", "pending", "requested"].includes(status)
+}
+
+function getCompletedRunState(run) {
+  if (run.conclusion === "success") return "success"
+  if (run.conclusion === "cancelled") return "cancelled"
+  return "failed"
+}
+
+function getCompletedRunMessage(state) {
+  if (state === "success") return "Deploy workflow completed successfully."
+  if (state === "cancelled") return "Deploy workflow was cancelled."
+  return "Deploy workflow completed with a non-success conclusion."
+}
+
+function normalizeWorkflowFileForGh(workflowFile) {
+  return String(workflowFile ?? "").trim().replace(/\\/g, "/")
+}
+
+function enrichDeployParsedResult(parsed, form) {
+  const workflowFile = normalizeWorkflowFileForGh(parsed?.workflow?.file || form.workflow)
+  const targetBranch = String(parsed?.targetBranch || form.branch || "").trim()
+
+  if (!parsed && !workflowFile && !targetBranch) {
+    return null
+  }
+
+  return {
+    ...(parsed || {}),
+    ok: parsed?.ok ?? Boolean(workflowFile && targetBranch && !(parsed?.missingRequiredInputs?.length)),
+    targetBranch,
+    workflow: {
+      ...(parsed?.workflow || {}),
+      file: workflowFile,
+      name: parsed?.workflow?.name || workflowFile
+    }
+  }
+}
+
+function getGithubTransportOptions() {
+  return {
+    getConfiguredToken: () => vscode.workspace.getConfiguration("pacvueDeploy").get("githubToken"),
+    runGit: (repoRoot, args) => runGitCommand(args, repoRoot).stdout.trim(),
+    runGhCommand: (args, cwd) => runCommand("gh", args, cwd)
+  }
+}
+
+async function getLatestWorkflowRunWithFallback(workspaceRoot, workflowFile, targetBranch) {
+  return queryLatestWorkflowRun({
+    repoRoot: workspaceRoot,
+    workflowFile: normalizeWorkflowFileForGh(workflowFile),
+    targetBranch,
+    ...getGithubTransportOptions()
+  })
+}
+
+async function cancelWorkflowRunWithFallback(workspaceRoot, runId) {
+  return cancelWorkflowRun({
+    repoRoot: workspaceRoot,
+    runId,
+    ...getGithubTransportOptions()
+  })
+}
+
+function runCommand(command, args, cwd) {
+  const result = childProcess.spawnSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 10,
+    env: getCommandEnv()
+  })
+
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? result.error?.message ?? ""
+  }
+}
+
+function parseJsonOutput(stdout) {
+  const text = String(stdout ?? "").trim()
+  if (!text.startsWith("{")) {
+    return null
+  }
+
+  try {
+    return JSON.parse(text)
+  } catch (_error) {
+    let depth = 0
+    let inString = false
+    let escaped = false
+
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index]
+
+      if (inString) {
+        if (escaped) {
+          escaped = false
+        } else if (char === "\\") {
+          escaped = true
+        } else if (char === '"') {
+          inString = false
+        }
+        continue
+      }
+
+      if (char === '"') {
+        inString = true
+        continue
+      }
+
+      if (char === "{") {
+        depth += 1
+      }
+
+      if (char === "}") {
+        depth -= 1
+        if (depth === 0) {
+          try {
+            return JSON.parse(text.slice(0, index + 1))
+          } catch (_innerError) {
+            return null
+          }
+        }
+      }
+    }
+
+    return null
+  }
+}
+
+function createNonce() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+  let nonce = ""
+  for (let index = 0; index < 32; index += 1) {
+    nonce += chars.charAt(Math.floor(Math.random() * chars.length))
+  }
+  return nonce
+}
+
+module.exports = {
+  activate,
+  deactivate
+}

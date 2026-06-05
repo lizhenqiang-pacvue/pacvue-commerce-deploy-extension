@@ -1,0 +1,50 @@
+{
+  "name": "pacvue-commerce-deploy-visual",
+  "displayName": "Pacvue Commerce Deploy",
+  "description": "Visual Cursor and VS Code sidebar for Pacvue commerce test deployments.",
+  "version": "0.3.9",
+  "publisher": "pacvue",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onView:pacvueCommerceDeployView", "onCommand:pacvueDeploy.focus"],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pacvueDeploy.focus",
+        "title": "Pacvue Deploy: Focus"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pacvueDeploy",
+          "title": "Pacvue Deploy",
+          "icon": "resources/faviconpacvue.ico"
+        }
+      ]
+    },
+    "views": {
+      "pacvueDeploy": [
+        {
+          "id": "pacvueCommerceDeployView",
+          "name": "Commerce Test Deploy",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Pacvue Deploy",
+      "properties": {
+        "pacvueDeploy.githubToken": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "GitHub Personal Access Token used when GitHub CLI (`gh`) is not installed, and preferred for workflow status polling/cancel when set (more reliable on Windows). Requires `repo` and `workflow` scopes. You can also set `GITHUB_TOKEN` or `GH_TOKEN` in the environment."
+        }
+      }
+    }
+  }
+}
