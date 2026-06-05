@@ -2,7 +2,16 @@ const https = require("node:https")
 const path = require("node:path")
 const { spawnSync } = require("node:child_process")
 
-const GH_RUN_JSON_FIELDS = "id,status,conclusion,url,displayTitle,createdAt,updatedAt"
+const GH_RUN_JSON_FIELDS = "databaseId,status,conclusion,url,displayTitle,createdAt,updatedAt"
+const GH_RUN_JSON_FIELDS_LEGACY = "id,status,conclusion,url,displayTitle,createdAt,updatedAt"
+
+function isUnknownGhJsonFieldError(stdout, stderr) {
+  return /Unknown JSON field:/i.test(`${stdout}\n${stderr}`)
+}
+
+function getGhRunJsonFieldSets() {
+  return [GH_RUN_JSON_FIELDS, GH_RUN_JSON_FIELDS_LEGACY]
+}
 
 function commandExists(command) {
   const result = spawnSync(command, ["--version"], {
@@ -570,30 +579,45 @@ function getLatestWorkflowRunViaGh({ workflowFile, targetBranch, runGhCommand, c
   let lastError = "Failed to query workflow run status."
 
   for (const workflow of workflowCandidates) {
-    const result = runGhCommand(
-      [
-        "run",
-        "list",
-        "--workflow",
-        workflow,
-        "--branch",
-        targetBranch,
-        "--limit",
-        "1",
-        "--json",
-        GH_RUN_JSON_FIELDS
-      ],
-      cwd
-    )
+    let runs = null
+    let lastGhError = lastError
 
-    if (result.status !== 0) {
-      lastError = formatGhPollError(result.stdout, result.stderr, lastError)
-      continue
+    for (const jsonFields of getGhRunJsonFieldSets()) {
+      const result = runGhCommand(
+        [
+          "run",
+          "list",
+          "--workflow",
+          workflow,
+          "--branch",
+          targetBranch,
+          "--limit",
+          "1",
+          "--json",
+          jsonFields
+        ],
+        cwd
+      )
+
+      if (result.status !== 0) {
+        lastGhError = formatGhPollError(result.stdout, result.stderr, lastGhError)
+        if (isUnknownGhJsonFieldError(result.stdout, result.stderr)) {
+          continue
+        }
+        break
+      }
+
+      runs = parseJsonArrayOutput(result.stdout)
+      if (!runs) {
+        lastGhError = formatGhPollError(result.stdout, result.stderr, "Failed to parse gh run list output.")
+        break
+      }
+
+      break
     }
 
-    const runs = parseJsonArrayOutput(result.stdout)
     if (!runs) {
-      lastError = formatGhPollError(result.stdout, result.stderr, "Failed to parse gh run list output.")
+      lastError = lastGhError
       continue
     }
 
