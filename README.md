@@ -66,6 +66,7 @@ Cursor / VS Code：**Extensions: Install from VSIX...** → 选择生成的 `pac
 | `pacvueDeploy.githubToken` | 无官方 `gh` 或 Windows 上 `gh` 不可靠时推荐；配置后轮询优先走 GitHub API |
 | `pacvueDeploy.createIssueOnFailure` | 发版触发失败或 workflow run 失败时，自动在扩展仓库创建 Issue（默认 `true`） |
 | `pacvueDeploy.issueRepo` | Issue 目标仓库，格式 `owner/repo`；留空则使用扩展 `package.json` 中的 repository |
+| `pacvueDeploy.notifyOnDeploySuccess` | workflow run 成功时弹出 VS Code 通知（默认 `true`） |
 
 也可使用环境变量 `GITHUB_TOKEN` / `GH_TOKEN`（需能被 Cursor 进程读取）。
 

@@ -2,7 +2,7 @@
   "name": "pacvue-commerce-deploy-visual",
   "displayName": "Pacvue Commerce Deploy",
   "description": "Visual Cursor and VS Code sidebar for Pacvue commerce test deployments.",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "publisher": "pacvue",
   "private": true,
   "repository": {
@@ -57,6 +57,11 @@
           "type": "string",
           "default": "",
           "markdownDescription": "GitHub repository (`owner/repo`) where deploy failure issues are created. Defaults to this extension's repository from package.json."
+        },
+        "pacvueDeploy.notifyOnDeploySuccess": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a VS Code notification when a deploy workflow run completes successfully."
         }
       }
     }

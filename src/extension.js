@@ -220,6 +220,11 @@ class DeployViewProvider {
             conclusion: run.conclusion,
             message: getCompletedRunMessage(state)
           })
+        } else if (state === "success") {
+          void this.notifyDeploySuccess({
+            parsed,
+            run
+          })
         }
         return
       }
@@ -298,6 +303,10 @@ class DeployViewProvider {
           message: getCompletedRunMessage(state)
         }
       })
+
+      if (state === "success") {
+        void this.notifyDeploySuccess({ parsed, run })
+      }
       return
     }
 
@@ -401,6 +410,44 @@ class DeployViewProvider {
     }
 
     return result
+  }
+
+  async notifyDeploySuccess(details) {
+    const config = vscode.workspace.getConfiguration("pacvueDeploy")
+    if (!config.get("notifyOnDeploySuccess", true)) {
+      return
+    }
+
+    const runId = details.run?.databaseId
+    if (runId) {
+      const notifiedRunIds = this.context.globalState.get("notifiedDeploySuccessRunIds", [])
+      if (notifiedRunIds.includes(runId)) {
+        return
+      }
+    }
+
+    const workflowName = details.parsed?.workflow?.name || details.parsed?.workflow?.file || "workflow"
+    const targetBranch = details.parsed?.targetBranch || ""
+    const runUrl = details.run?.url
+    const openRunAction = "Open Run"
+    const actions = runUrl ? [openRunAction] : []
+
+    const selection = await vscode.window.showInformationMessage(
+      `Deploy succeeded: ${workflowName}${targetBranch ? ` @ ${targetBranch}` : ""}`,
+      ...actions
+    )
+
+    if (selection === openRunAction && runUrl) {
+      await vscode.env.openExternal(vscode.Uri.parse(runUrl))
+    }
+
+    if (runId) {
+      const notifiedRunIds = this.context.globalState.get("notifiedDeploySuccessRunIds", [])
+      await this.context.globalState.update("notifiedDeploySuccessRunIds", [
+        ...notifiedRunIds.filter((id) => id !== runId).slice(-99),
+        runId
+      ])
+    }
   }
 
   getHtml(webview) {
