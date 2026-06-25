@@ -2,7 +2,7 @@
   "name": "pacvue-commerce-deploy-visual",
   "displayName": "Pacvue Commerce Deploy",
   "description": "Visual Cursor and VS Code sidebar for Pacvue commerce test deployments.",
-  "version": "0.3.14",
+  "version": "0.3.20",
   "publisher": "pacvue",
   "private": true,
   "repository": {

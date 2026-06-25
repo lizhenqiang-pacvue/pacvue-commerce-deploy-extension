@@ -2,4 +2,11 @@
 *.vsix
 .gitignore
 .cursor/**
+.claude/**
 .vscode/**
+.DS_Store
+.github/**
+docs/**
+scripts/triage-deploy-issue.js
+scripts/send-project-config-email.js
+scripts/run-parser-fix-agent.js

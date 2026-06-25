@@ -20,6 +20,7 @@ select {
 }
 
 .shell {
+  position: relative;
   display: grid;
   gap: 14px;
   padding: 14px;
@@ -72,6 +73,30 @@ h1 {
 
 .status-pill[data-variant="error"] {
   color: var(--vscode-testing-iconFailed);
+}
+
+.cache-status {
+  margin: -4px 0 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+}
+
+.cache-status[data-variant="ready"] {
+  color: var(--vscode-testing-iconPassed);
+}
+
+.cache-status[data-variant="running"] {
+  color: var(--vscode-testing-iconQueued);
+}
+
+.cache-status[data-variant="error"] {
+  color: var(--vscode-testing-iconFailed);
+}
+
+.input-source-hint {
+  margin-top: -2px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
 }
 
 .panel {
@@ -257,6 +282,195 @@ button:focus {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+}
+
+.history-panel[hidden],
+.presets-panel[hidden] {
+  display: none;
+}
+
+.history-list,
+.presets-list {
+  display: grid;
+  gap: 8px;
+}
+
+.history-row,
+.preset-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--vscode-sideBarSectionHeader-border);
+  border-radius: 8px;
+  background: var(--vscode-input-background);
+}
+
+.history-meta,
+.history-inputs,
+.preset-meta,
+.preset-sub,
+.preset-inputs {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-meta,
+.preset-meta {
+  color: var(--vscode-foreground);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.history-inputs,
+.preset-inputs,
+.preset-sub {
+  grid-column: 1 / -1;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+
+.history-ts {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.history-reuse,
+.muted-action {
+  min-height: 24px;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.history-actions,
+.preset-actions {
+  display: flex;
+  gap: 20px;
+  justify-content: flex-end;
+}
+
+.save-preset-btn {
+  width: 100%;
+}
+
+.muted-action {
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  border: 1px solid var(--vscode-input-border);
+}
+
+.confirm-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: flex-start;
+  padding: 14px;
+  background: color-mix(in srgb, var(--vscode-sideBar-background) 88%, transparent);
+}
+
+.confirm-overlay[hidden] {
+  display: none;
+}
+
+.confirm-card {
+  width: 100%;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 30%);
+}
+
+.confirm-summary {
+  display: grid;
+  gap: 8px;
+}
+
+.confirm-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+  font-size: 12px;
+}
+
+.confirm-label {
+  color: var(--vscode-descriptionForeground);
+}
+
+.confirm-value {
+  overflow-wrap: anywhere;
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
+.failure-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  border-top: 1px solid var(--vscode-sideBarSectionHeader-border);
+}
+
+.failure-card-header {
+  color: var(--vscode-testing-iconFailed);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.failure-card-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.failure-card-label {
+  color: var(--vscode-descriptionForeground);
+}
+
+.failure-card-value {
+  overflow-wrap: anywhere;
+  color: var(--vscode-foreground);
+}
+
+.failure-card-link {
+  min-height: auto;
+  padding: 0;
+  border: 0;
+  color: var(--vscode-textLink-foreground);
+  background: transparent;
+  text-align: left;
+  word-break: break-all;
+}
+
+.failure-card-jobs {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--vscode-textCodeBlock-background);
+  font-family: var(--vscode-editor-font-family);
+  font-size: 11px;
+}
+
+.failure-card-job {
+  color: var(--vscode-testing-iconFailed);
+  line-height: 1.45;
+}
+
+.failure-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.failure-card-action {
+  min-height: 26px;
+  padding: 2px 10px;
+  border-radius: 7px;
+  font-size: 11px;
 }
 
 button {

@@ -1,0 +1,121 @@
+name: Deploy Issue Triage
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to triage"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  triage:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.issue.title, '[auto-triage]')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout extension repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Load issue for manual run
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p .triage
+          gh issue view "${{ inputs.issue_number }}" --repo "$REPO" --json number,title,body,url,labels > .triage/manual-issue.json
+
+      - name: Triage deploy issue
+        id: triage
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            node scripts/triage-deploy-issue.js --issue-json .triage/manual-issue.json --out .triage
+          else
+            node scripts/triage-deploy-issue.js --event "$GITHUB_EVENT_PATH" --out .triage
+          fi
+
+      - name: Apply triage labels and comment
+        run: |
+          ISSUE_NUMBER="${{ steps.triage.outputs.issue_number }}"
+          LABELS="${{ steps.triage.outputs.labels }}"
+          if [ -n "$LABELS" ]; then
+            IFS=',' read -ra LABEL_ARRAY <<< "$LABELS"
+            for LABEL in "${LABEL_ARRAY[@]}"; do
+              gh label create "$LABEL" --repo "$REPO" --color "ededed" --description "Pacvue Deploy auto triage" 2>/dev/null || true
+            done
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "$LABELS"
+          fi
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file .triage/issue-comment.md
+
+      - name: Send project config email
+        id: email
+        if: steps.triage.outputs.should_send_email == 'true'
+        env:
+          PACVUE_DEPLOY_TRIAGE_EMAIL_TO: ${{ secrets.PACVUE_DEPLOY_TRIAGE_EMAIL_TO }}
+          PACVUE_DEPLOY_EMAIL_ENDPOINT: ${{ vars.PACVUE_DEPLOY_EMAIL_ENDPOINT }}
+          PACVUE_DEPLOY_EMAIL_PRODUCT_LINE: ${{ vars.PACVUE_DEPLOY_EMAIL_PRODUCT_LINE }}
+          PACVUE_DEPLOY_EMAIL_SETTING_NAME: ${{ vars.PACVUE_DEPLOY_EMAIL_SETTING_NAME }}
+        run: node scripts/send-project-config-email.js --triage-result .triage/result.json
+
+      - name: Comment email result
+        if: steps.triage.outputs.should_send_email == 'true' && always()
+        run: |
+          ISSUE_NUMBER="${{ steps.triage.outputs.issue_number }}"
+          if [ -f .triage/email-result.md ]; then
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file .triage/email-result.md
+          fi
+
+      - name: Run parser fix agent
+        id: parser_fix
+        if: steps.triage.outputs.should_open_parser_fix_pr == 'true'
+        env:
+          PACVUE_DEPLOY_PARSER_FIX_COMMAND: ${{ vars.PACVUE_DEPLOY_PARSER_FIX_COMMAND }}
+        run: node scripts/run-parser-fix-agent.js --triage-result .triage/result.json --prompt-file .triage/parser-fix-prompt.md
+
+      - name: Check parser fix diff
+        id: diff
+        if: steps.triage.outputs.should_open_parser_fix_pr == 'true'
+        run: |
+          if [ -z "$(git status --porcelain --untracked-files=all -- . ':!.triage')" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create parser fix PR
+        if: steps.triage.outputs.should_open_parser_fix_pr == 'true' && steps.diff.outputs.has_changes == 'true'
+        run: |
+          ISSUE_NUMBER="${{ steps.triage.outputs.issue_number }}"
+          BRANCH="auto/deploy-issue-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add --all -- . ':!.triage'
+          git commit -m "fix: handle deploy issue #${ISSUE_NUMBER}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --repo "$REPO" \
+            --base "${GITHUB_REF_NAME:-main}" \
+            --head "$BRANCH" \
+            --title "fix: handle deploy issue #${ISSUE_NUMBER}" \
+            --body-file .triage/pr-body.md
+
+      - name: Comment parser fix skipped
+        if: steps.triage.outputs.should_open_parser_fix_pr == 'true' && steps.diff.outputs.has_changes != 'true'
+        run: |
+          ISSUE_NUMBER="${{ steps.triage.outputs.issue_number }}"
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "Classified as a plugin parser issue, but no source diff was produced. Configure repository variable PACVUE_DEPLOY_PARSER_FIX_COMMAND to let the workflow apply parser fixes automatically."

@@ -499,9 +499,11 @@ async function getLatestWorkflowRunViaApi({ apiConfig, workflowFile, targetBranc
   let lastMessage = "GitHub API run lookup failed."
 
   for (const workflowId of workflowIds) {
+    const queryPath = `${buildRepoApiPath(apiConfig, `/actions/workflows/${encodeURIComponent(workflowId)}/runs`)}?branch=${encodeURIComponent(targetBranch)}&per_page=1`
+
     const response = await githubApiRequest(
       "GET",
-      `${buildRepoApiPath(apiConfig, `/actions/workflows/${encodeURIComponent(workflowId)}/runs`)}?branch=${encodeURIComponent(targetBranch)}&per_page=1`,
+      queryPath,
       null,
       token,
       apiConfig
@@ -516,7 +518,9 @@ async function getLatestWorkflowRunViaApi({ apiConfig, workflowFile, targetBranc
       return { ok: false, error: lastMessage }
     }
 
-    const run = response.body?.workflow_runs?.[0]
+    const runs = response.body?.workflow_runs ?? []
+
+    const run = runs[0]
     if (!run) {
       return { ok: false, error: "Workflow run has not appeared yet. Next status check runs in 1 minute." }
     }
@@ -584,21 +588,20 @@ function getLatestWorkflowRunViaGh({ workflowFile, targetBranch, runGhCommand, c
     let lastGhError = lastError
 
     for (const jsonFields of getGhRunJsonFieldSets()) {
-      const result = runGhCommand(
-        [
-          "run",
-          "list",
-          "--workflow",
-          workflow,
-          "--branch",
-          targetBranch,
-          "--limit",
-          "1",
-          "--json",
-          jsonFields
-        ],
-        cwd
-      )
+      const args = [
+        "run",
+        "list",
+        "--workflow",
+        workflow,
+        "--branch",
+        targetBranch,
+        "--limit",
+        "1",
+        "--json",
+        jsonFields
+      ]
+
+      const result = runGhCommand(args, cwd)
 
       if (result.status !== 0) {
         lastGhError = formatGhPollError(result.stdout, result.stderr, lastGhError)
@@ -778,7 +781,7 @@ async function getLastSuccessfulRunInputs({ repoRoot, workflowFile, targetBranch
   if (canUseGithubCli() && typeof runGhCommand === "function") {
     const workflowName = normalizeWorkflowFileForApi(workflowFile)
     const result = runGhCommand(
-      ["run", "list", "--workflow", workflowName, "--status=success", "--limit", "20", "--json", "displayTitle"],
+      ["run", "list", "--workflow", workflowName, "--branch", targetBranch, "--status=success", "--limit", "20", "--json", "displayTitle"],
       repoRoot
     )
 

@@ -14,6 +14,10 @@ const {
 
 const VIEW_ID = "pacvueCommerceDeployView"
 const RUN_STATUS_POLL_INTERVAL_MS = 60 * 1000
+const DEPLOY_HISTORY_KEY = "pacvueDeploy.deployHistory"
+const DEPLOY_HISTORY_LIMIT = 10
+const DEPLOY_PRESETS_KEY = "pacvueDeploy.presets"
+const DEPLOY_PRESETS_LIMIT = 20
 
 function activate(context) {
   const provider = new DeployViewProvider(context)
@@ -29,6 +33,103 @@ class DeployViewProvider {
     this.context = context
     this.pollTimer = null
     this.activeRun = null
+  }
+
+  // Builds a globalState key scoped per repo + workflow + branch so that cached
+  // inputs from different projects/workflows/branches never collide.
+  lastInputsKey(repoId, workflow, branch) {
+    return `pacvueDeploy.lastInputs::${repoId}::${workflow || ""}::${branch}`
+  }
+
+  // Resolves a stable repo identity (owner/repo) for the cache key, falling back
+  // to the workspace path when the origin remote can't be parsed.
+  getRepoId(workspaceRoot) {
+    try {
+      const repo = getGithubRepoInfo(workspaceRoot, (repoRoot, gitArgs) => runGitCommand(gitArgs, repoRoot).stdout.trim())
+      if (repo?.owner && repo?.repo) {
+        return `${repo.owner}/${repo.repo}`
+      }
+    } catch (_error) {
+      // fall through to path-based id
+    }
+    return workspaceRoot
+  }
+
+  // Persists the inputs submitted for a successful deploy, keyed per repo/workflow/branch.
+  saveLastInputs(workspaceRoot, workflow, branch, inputs) {
+    if (!workspaceRoot || !branch) return
+    const cleaned = {}
+    for (const [key, value] of Object.entries(inputs || {})) {
+      if (value === undefined || value === null || value === "") continue
+      cleaned[key] = value
+    }
+    if (Object.keys(cleaned).length === 0) return
+    const cacheKey = this.lastInputsKey(this.getRepoId(workspaceRoot), workflow, branch)
+    this.context.globalState.update(cacheKey, cleaned)
+  }
+
+  // Reads previously cached inputs for a repo/workflow/branch (empty object if none).
+  readLastInputs(workspaceRoot, workflow, branch) {
+    if (!workspaceRoot || !branch) return {}
+    const cacheKey = this.lastInputsKey(this.getRepoId(workspaceRoot), workflow, branch)
+    const cached = this.context.globalState.get(cacheKey)
+    return cached && typeof cached === "object" ? cached : {}
+  }
+
+  getDeployHistory() {
+    const history = this.context.globalState.get(DEPLOY_HISTORY_KEY, [])
+    return Array.isArray(history) ? history : []
+  }
+
+  async appendDeployHistory(workspaceRoot, form, parsed) {
+    const ts = Date.now()
+    const repoId = this.getRepoId(workspaceRoot)
+    const entry = {
+      id: String(ts),
+      ts,
+      repoId,
+      branch: parsed?.targetBranch || form.branch,
+      workflow: form.workflow,
+      workflowName: parsed?.workflow?.name || form.workflow,
+      inputs: { ...(form.inputs || {}) }
+    }
+    const signature = JSON.stringify({ repoId: entry.repoId, branch: entry.branch, workflow: entry.workflow, inputs: entry.inputs })
+    const next = [entry, ...this.getDeployHistory().filter((item) => JSON.stringify({ repoId: item.repoId, branch: item.branch, workflow: item.workflow, inputs: item.inputs || {} }) !== signature)].slice(0, DEPLOY_HISTORY_LIMIT)
+    await this.context.globalState.update(DEPLOY_HISTORY_KEY, next)
+    return next
+  }
+
+  async clearDeployHistory() {
+    await this.context.globalState.update(DEPLOY_HISTORY_KEY, [])
+  }
+
+  getDeployPresets() {
+    const presets = this.context.globalState.get(DEPLOY_PRESETS_KEY, [])
+    return Array.isArray(presets) ? presets : []
+  }
+
+  async saveDeployPreset(workspaceRoot, form, name) {
+    const repoId = this.getRepoId(workspaceRoot)
+    const workflowMetadata = workspaceRoot ? getWorkflowMetadata(findDeployScript(workspaceRoot, this.context.extensionPath), workspaceRoot) : { workflows: [] }
+    const workflow = workflowMetadata.workflows.find((item) => item.file === form.workflow)
+    const entry = {
+      id: String(Date.now()),
+      name,
+      repoId,
+      branch: form.branch,
+      workflow: form.workflow,
+      workflowName: workflow?.name || form.workflow,
+      inputs: { ...(form.inputs || {}) }
+    }
+    const next = [entry, ...this.getDeployPresets().filter((item) => item.id !== entry.id)].slice(0, DEPLOY_PRESETS_LIMIT)
+    await this.context.globalState.update(DEPLOY_PRESETS_KEY, next)
+    return next
+  }
+
+  async deleteDeployPreset(id) {
+    const next = this.getDeployPresets().filter((item) => item.id !== id)
+    await this.context.globalState.update(DEPLOY_PRESETS_KEY, next)
+    return next
   }
 
   resolveWebviewView(webviewView) {
@@ -49,8 +150,87 @@ class DeployViewProvider {
         return
       }
 
+      if (message.type === "queryLastRun") {
+        await this.queryLastRunConfig(webviewView, message.payload)
+        return
+      }
+
+      if (message.type === "clearHistory") {
+        await this.clearDeployHistory()
+        webviewView.webview.postMessage({ type: "history", payload: { entries: [] } })
+        return
+      }
+
+      if (message.type === "savePreset") {
+        const workspaceRoot = getWorkspaceRoot()
+        const name = String(message.payload?.name ?? "").trim()
+        if (workspaceRoot && name) {
+          const entries = await this.saveDeployPreset(workspaceRoot, message.payload, name)
+          webviewView.webview.postMessage({ type: "presets", payload: { entries } })
+        }
+        return
+      }
+
+      if (message.type === "deletePreset") {
+        const entries = await this.deleteDeployPreset(String(message.payload?.id ?? ""))
+        webviewView.webview.postMessage({ type: "presets", payload: { entries } })
+        return
+      }
+
+      if (message.type === "openExternal" && message.url) {
+        await vscode.env.openExternal(vscode.Uri.parse(String(message.url)))
+        return
+      }
+
       if (message.type === "cancel") {
         await this.cancelDeployCommand(webviewView)
+      }
+    })
+  }
+
+  async queryLastRunConfig(webviewView, payload = {}) {
+    const { branch, workflow, requestId } = payload
+    const emptyResult = {
+      type: "lastRunConfig",
+      payload: { requestId, branch, workflow, ok: false, resolvedInputs: {}, lastRunInputs: {} }
+    }
+
+    const workspaceRoot = getWorkspaceRoot()
+    if (!workspaceRoot || !branch) {
+      webviewView.webview.postMessage(emptyResult)
+      return
+    }
+
+    const scriptPath = findDeployScript(workspaceRoot, this.context.extensionPath)
+    if (!scriptPath) {
+      webviewView.webview.postMessage(emptyResult)
+      return
+    }
+
+    const args = buildScriptArgs(scriptPath, { branch, workflow, inputs: {} }, "dry-run", { skipLastRunInputs: false })
+    const result = await runCommandAsync("node", args, workspaceRoot)
+    const parsed = parseJsonOutput(result.stdout)
+
+    // GitHub can't expose a past run's dispatch inputs, so fall back to the inputs
+    // this plugin cached on the last successful deploy of the same repo/workflow/branch.
+    // GitHub-parsed values (from run-name) still win where available.
+    const cachedInputs = this.readLastInputs(workspaceRoot, workflow, branch)
+    const githubLastRunInputs = parsed?.lastRunInputs ?? {}
+    const lastRunInputs = { ...cachedInputs, ...githubLastRunInputs }
+    const inputSources = buildInputSources(cachedInputs, githubLastRunInputs)
+    const configSource = buildConfigSource(cachedInputs, githubLastRunInputs)
+
+    webviewView.webview.postMessage({
+      type: "lastRunConfig",
+      payload: {
+        requestId,
+        branch,
+        workflow,
+        ok: result.status === 0 && Boolean(parsed),
+        resolvedInputs: parsed?.resolvedInputs ?? {},
+        lastRunInputs,
+        inputSources,
+        configSource
       }
     })
   }
@@ -76,7 +256,9 @@ class DeployViewProvider {
         scriptPath,
         workflows: workflowMetadata.workflows,
         workflowError: workflowMetadata.error,
-        githubAuth: getGithubAuthSummary(getGithubTransportOptions())
+        githubAuth: getGithubAuthSummary(getGithubTransportOptions()),
+        deployHistory: this.getDeployHistory(),
+        deployPresets: this.getDeployPresets()
       }
     })
   }
@@ -109,6 +291,9 @@ class DeployViewProvider {
     const command = ["node", ...args].join(" ")
 
     if (action === "dispatch" && ok) {
+      this.saveLastInputs(workspaceRoot, form.workflow, form.branch, form.inputs)
+      const deployHistory = await this.appendDeployHistory(workspaceRoot, form, parsed)
+      webviewView.webview.postMessage({ type: "history", payload: { entries: deployHistory } })
       webviewView.webview.postMessage({
         type: "runStatus",
         payload: {
@@ -196,6 +381,8 @@ class DeployViewProvider {
       if (!isWorkflowRunInProgress(run.status)) {
         this.stopRunStatusPolling()
         const state = getCompletedRunState(run)
+        const jobsSummary = state === "failed" ? await getRunJobsSummaryForDiagnosis(workspaceRoot, run) : null
+        const failureDiagnosis = state === "failed" ? buildFailureDiagnosis({ run, parsed, conclusion: run.conclusion, jobsSummary }) : null
 
         webviewView.webview.postMessage({
           type: "runStatus",
@@ -206,7 +393,9 @@ class DeployViewProvider {
             run,
             parsed,
             command,
-            message: getCompletedRunMessage(state)
+            message: getCompletedRunMessage(state),
+            jobsSummary,
+            failureDiagnosis
           }
         })
 
@@ -218,7 +407,8 @@ class DeployViewProvider {
             command,
             run,
             conclusion: run.conclusion,
-            message: getCompletedRunMessage(state)
+            message: getCompletedRunMessage(state),
+            jobsSummary
           })
         } else if (state === "success") {
           void this.notifyDeploySuccess({
@@ -311,6 +501,7 @@ class DeployViewProvider {
     }
 
     const cancelResult = await cancelWorkflowRunWithFallback(workspaceRoot, run.databaseId)
+
     webviewView.webview.postMessage({
       type: "runStatus",
       payload: {
@@ -321,7 +512,7 @@ class DeployViewProvider {
         parsed,
         command,
         message: cancelResult.ok
-          ? "Cancel requested. Polling will continue until GitHub reports a final status."
+          ? "Cancel requested. Waiting for GitHub to confirm cancellation."
           : cancelResult.error || "Failed to cancel workflow run."
       }
     })
@@ -355,9 +546,9 @@ class DeployViewProvider {
     const githubSnapshot = collectGithubDirectorySnapshot(details.workspaceRoot, {
       priorityWorkflowFile: details.parsed?.workflow?.file
     })
-    let jobsSummary = null
+    let jobsSummary = details.jobsSummary ?? null
 
-    if (runId && details.workspaceRoot) {
+    if (jobsSummary === null && runId && details.workspaceRoot) {
       jobsSummary = await getWorkflowRunJobsSummary({
         repoRoot: details.workspaceRoot,
         runId,
@@ -474,19 +665,6 @@ class DeployViewProvider {
       <span class="status-pill" id="statusPill">Idle</span>
     </section>
 
-    <details class="panel help-panel">
-      <summary>使用说明</summary>
-      <ol>
-        <li>在 Pacvue Commerce 仓库根目录打开本面板，选择 <strong>Target branch</strong> 与 <strong>Workflow</strong>（名称含「测试环境发版」）。</li>
-        <li>填写 workflow 动态参数（如 ProjectName、environment、buildcmd），点击 <strong>Run</strong> 触发 GitHub Actions。</li>
-        <li>发版后约每分钟轮询一次状态；进行中可点 <strong>Cancel</strong>。结果区可复制命令与 Run URL。</li>
-        <li><strong>方式 A — 无 GitHub CLI</strong>：在设置中配置 <code>pacvueDeploy.githubToken</code> 或环境变量 <code>GITHUB_TOKEN</code>（<code>repo</code> + <code>workflow</code>），Reload Window。发版、轮询、取消均走 GitHub API。</li>
-        <li><strong>方式 B — 有官方 GitHub CLI</strong>：安装 <code>gh</code> 并执行 <code>gh auth login</code>。发版与轮询走 <code>gh</code>；若同时配置了 Token，轮询优先 API。</li>
-        <li><strong>Windows 注意</strong>：Volta/npm 的 <code>gh</code> 不是官方 CLI；无官方 gh 时请用方式 A。</li>
-      </ol>
-      <p class="help-foot">更多说明见扩展目录 README.md；发版前可用命令行 <code>--dry-run</code> 预览。</p>
-    </details>
-
     <section class="panel">
       <label>
         <span>Target branch</span>
@@ -504,11 +682,24 @@ class DeployViewProvider {
 
       <div id="dynamicInputs" class="grid"></div>
 
+      <p class="cache-status" id="cacheStatus">Last config: not loaded</p>
+
       <div class="actions">
         <button id="runButton">Run</button>
         <button id="cancelButton" class="danger" disabled>Cancel</button>
       </div>
+      <button id="savePresetButton" class="muted-action save-preset-btn">Save as Preset</button>
     </section>
+
+    <details class="panel presets-panel" id="presetsPanel" hidden>
+      <summary>Presets</summary>
+      <div id="presetsList" class="presets-list"></div>
+    </details>
+
+    <details class="panel history-panel" id="historyPanel" hidden>
+      <summary>Recent Deploys</summary>
+      <div id="historyList" class="history-list"></div>
+    </details>
 
     <section class="output" aria-live="polite">
       <div class="output-header">
@@ -517,6 +708,31 @@ class DeployViewProvider {
       </div>
       <pre id="output">Click Run to trigger the selected GitHub Actions workflow.</pre>
     </section>
+
+    <div id="confirmOverlay" class="confirm-overlay" hidden>
+      <div class="confirm-card panel">
+        <p class="eyebrow">发版确认</p>
+        <div id="confirmSummary" class="confirm-summary"></div>
+        <div class="actions">
+          <button id="confirmOkButton">Confirm Deploy</button>
+          <button id="confirmCancelButton" class="danger">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="presetNameOverlay" class="confirm-overlay" hidden>
+      <div class="confirm-card panel">
+        <p class="eyebrow">保存预设</p>
+        <label>
+          <span>Preset name</span>
+          <input id="presetNameInput" type="text" placeholder="e.g. 项目A测试环境">
+        </label>
+        <div class="actions">
+          <button id="presetNameOkButton">Save</button>
+          <button id="presetNameCancelButton" class="danger">Cancel</button>
+        </div>
+      </div>
+    </div>
   </main>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
@@ -524,13 +740,16 @@ class DeployViewProvider {
   }
 }
 
-function buildScriptArgs(scriptPath, form, action) {
+function buildScriptArgs(scriptPath, form, action, { skipLastRunInputs = true } = {}) {
   const args = [
     scriptPath,
     "--branch",
-    form.branch,
-    "--skip-last-run-inputs"
+    form.branch
   ]
+
+  if (skipLastRunInputs) {
+    args.push("--skip-last-run-inputs")
+  }
 
   if (form.workflow) {
     args.push("--workflow", form.workflow)
@@ -1002,6 +1221,76 @@ function getCompletedRunMessage(state) {
   return "Deploy workflow completed with a non-success conclusion."
 }
 
+function buildInputSources(cachedInputs, githubLastRunInputs) {
+  const sources = {}
+  Object.keys(cachedInputs || {}).forEach((key) => {
+    sources[key] = "cache"
+  })
+  Object.keys(githubLastRunInputs || {}).forEach((key) => {
+    sources[key] = "github"
+  })
+  return sources
+}
+
+function buildConfigSource(cachedInputs, githubLastRunInputs) {
+  const cacheCount = Object.keys(cachedInputs || {}).length
+  const githubCount = Object.keys(githubLastRunInputs || {}).length
+  return {
+    source: githubCount > 0 ? (cacheCount > 0 ? "mixed" : "github") : cacheCount > 0 ? "cache" : "none",
+    cacheCount,
+    githubCount
+  }
+}
+
+async function getRunJobsSummaryForDiagnosis(workspaceRoot, run) {
+  const runId = run?.databaseId
+  if (!workspaceRoot || !runId) return null
+
+  const transportOptions = getGithubTransportOptions()
+  if (!hasGithubAuth(transportOptions)) return null
+
+  return getWorkflowRunJobsSummary({
+    repoRoot: workspaceRoot,
+    runId,
+    getConfiguredToken: transportOptions.getConfiguredToken,
+    runGit: (repoRoot, args) => runGitCommand(args, repoRoot).stdout.trim()
+  })
+}
+
+function buildFailureDiagnosis({ run, parsed, conclusion, jobsSummary }) {
+  const jobs = Array.isArray(jobsSummary) ? jobsSummary : []
+  return {
+    conclusion: conclusion || "failure",
+    stage: inferFailureStage(jobs, conclusion),
+    likelyReason: inferLikelyReason(jobs, conclusion, parsed),
+    workflowName: parsed?.workflow?.name || parsed?.workflow?.file || "Selected workflow",
+    targetBranch: parsed?.targetBranch || "",
+    runId: run?.databaseId ?? null,
+    runUrl: run?.url ?? null,
+    jobsSummary: jobs
+  }
+}
+
+function inferFailureStage(jobsSummary, conclusion) {
+  if (conclusion === "cancelled") return "Cancelled"
+  const firstJob = jobsSummary?.[0]
+  if (!firstJob) return "Workflow run"
+  const firstStep = firstJob.failedSteps?.[0]
+  return firstStep ? `${firstJob.name} > ${firstStep}` : firstJob.name
+}
+
+function inferLikelyReason(jobsSummary, conclusion, parsed) {
+  if (conclusion === "cancelled") return "Workflow was cancelled before completion."
+  const firstJob = jobsSummary?.[0]
+  if (!firstJob) {
+    return parsed?.reason || "Workflow completed with a non-success conclusion. Open the GitHub run for details."
+  }
+
+  const firstStep = firstJob.failedSteps?.[0]
+  if (firstStep) return `Step "${firstStep}" failed in job "${firstJob.name}".`
+  return `Job "${firstJob.name}" failed.`
+}
+
 function normalizeWorkflowFileForGh(workflowFile) {
   return String(workflowFile ?? "").trim().replace(/\\/g, "/")
 }
@@ -1235,6 +1524,30 @@ function runCommand(command, args, cwd) {
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? result.error?.message ?? ""
   }
+}
+
+function runCommandAsync(command, args, cwd) {
+  return new Promise((resolve) => {
+    const child = childProcess.spawn(command, args, {
+      cwd,
+      env: getCommandEnv()
+    })
+
+    let stdout = ""
+    let stderr = ""
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString()
+    })
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString()
+    })
+    child.on("error", (error) => {
+      resolve({ status: 1, stdout, stderr: stderr || error.message })
+    })
+    child.on("close", (code) => {
+      resolve({ status: code ?? 1, stdout, stderr })
+    })
+  })
 }
 
 function parseJsonOutput(stdout) {

@@ -299,17 +299,28 @@ function validateRemoteBranch(repoRoot, branch) {
   return result.status === 0
 }
 
+// Maps legacy Chinese run-name labels to workflow input names for backward compatibility.
+const DISPLAY_TITLE_KEY_ALIASES = {
+  项目名称: "ProjectName",
+  环境: "environment",
+  分支: "branch"
+}
+
+// Parses a run's displayTitle (run-name) into workflow inputs. Expects segments
+// separated by "|" or ",", each "key: value" or "key=value". Keys are matched to
+// workflow input names verbatim (e.g. ProjectName/environment/buildcmd), with
+// legacy Chinese labels (项目名称/环境/分支) mapped via aliases.
 function parseDisplayTitle(displayTitle) {
   const parsed = {}
-  for (const part of displayTitle.split(",")) {
-    const [rawKey, ...rawValue] = part.split(":")
-    const key = rawKey?.trim()
-    const value = rawValue.join(":").trim()
-    if (!key || !value) continue
+  for (const part of String(displayTitle).split(/[|,]/)) {
+    const match = part.match(/^\s*([^:=：]+?)\s*[:=：]\s*(.+?)\s*$/)
+    if (!match) continue
+    const rawKey = match[1].trim()
+    const value = match[2].trim()
+    if (!rawKey || !value) continue
 
-    if (key === "项目名称") parsed.ProjectName = value
-    if (key === "环境") parsed.environment = value
-    if (key === "分支") parsed.branch = value
+    const key = DISPLAY_TITLE_KEY_ALIASES[rawKey] ?? rawKey
+    parsed[key] = value
   }
   return parsed
 }
@@ -480,6 +491,7 @@ async function main(argv = process.argv.slice(2)) {
     headBranch,
     targetBranch,
     resolvedInputs: inputResolution.resolvedInputs,
+    lastRunInputs,
     missingRequiredInputs: inputResolution.missingRequiredInputs,
     suggestions: inputResolution.suggestions,
     command,
