@@ -2,8 +2,9 @@
 
 在 Cursor / VS Code 活动栏提供 **Pacvue Deploy** 面板，用于选择测试分支、workflow 与输入参数，触发 Pacvue Commerce 测试环境 GitHub Actions 发版，并轮询运行状态。
 
-## 最近更新（0.3.20）
+## 最近更新（0.3.21）
 
+- **Recent Deploys 项目隔离**：Recent Deploys 现在按当前 Commerce 仓库单独保存，不再和其他项目共用历史记录。
 - **发版确认**：点击 **Run** 后会先展示确认页，确认目标分支、workflow 与输入参数后再点击 **Confirm Deploy** 触发 GitHub Actions。
 - **上次配置回填**：选择分支和 workflow 后，插件会读取同仓库、同 workflow、同分支的上次发版配置；来源会显示为 `Last config: from GitHub last run`、`from local cache`、`from GitHub last run + local cache` 或 `unavailable`。
 - **Recent Deploys**：本机保存最近成功发版配置，可一键复用，也可清空历史。
@@ -170,7 +171,7 @@ gh auth status
 
 ### 插件里看不到新功能
 
-确认已安装 `pacvue-commerce-deploy-visual-0.3.20.vsix` 或更新版本，并执行 **Developer: Reload Window**。如果仍看不到 **Presets**、**Recent Deploys**、确认页或失败诊断卡片，先卸载旧版扩展后重新从 VSIX 安装。
+确认已安装 `pacvue-commerce-deploy-visual-0.3.21.vsix` 或更新版本，并执行 **Developer: Reload Window**。如果仍看不到 **Presets**、**Recent Deploys**、确认页或失败诊断卡片，先卸载旧版扩展后重新从 VSIX 安装。
 
 ## 本地开发
 
