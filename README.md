@@ -58,7 +58,7 @@
 ### 配置回填、历史与预设
 
 - `Last config` 会优先读取 GitHub 上该分支、workflow 的最近运行信息；GitHub 无法返回完整 dispatch inputs 时，会合并插件本机缓存的上次成功发版输入。
-- `Recent Deploys` 只保存在本机 VS Code / Cursor global state 中，用于快速复用最近成功发版参数。
+- `Recent Deploys` 按当前 Commerce 仓库单独保存在本机 VS Code / Cursor global state 中，用于快速复用最近成功发版参数，不会和其他项目混用。
 - `Presets` 也只保存在本机；适合保存常用项目、环境、buildcmd 组合。
 - 历史和预设不会随 VSIX 上传，也不会写入 Commerce 仓库。
 

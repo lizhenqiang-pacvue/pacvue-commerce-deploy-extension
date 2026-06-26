@@ -76,9 +76,26 @@ class DeployViewProvider {
     return cached && typeof cached === "object" ? cached : {}
   }
 
-  getDeployHistory() {
-    const history = this.context.globalState.get(DEPLOY_HISTORY_KEY, [])
-    return Array.isArray(history) ? history : []
+  deployHistoryKey(repoId) {
+    return `${DEPLOY_HISTORY_KEY}::${repoId}`
+  }
+
+  getDeployHistoryForRepo(repoId) {
+    if (!repoId) return []
+
+    const scopedHistory = this.context.globalState.get(this.deployHistoryKey(repoId), [])
+    if (Array.isArray(scopedHistory) && scopedHistory.length) {
+      return scopedHistory
+    }
+
+    const legacyHistory = this.context.globalState.get(DEPLOY_HISTORY_KEY, [])
+    if (!Array.isArray(legacyHistory)) return []
+    return legacyHistory.filter((item) => item?.repoId === repoId)
+  }
+
+  getDeployHistory(workspaceRoot) {
+    if (!workspaceRoot) return []
+    return this.getDeployHistoryForRepo(this.getRepoId(workspaceRoot))
   }
 
   async appendDeployHistory(workspaceRoot, form, parsed) {
@@ -94,13 +111,29 @@ class DeployViewProvider {
       inputs: { ...(form.inputs || {}) }
     }
     const signature = JSON.stringify({ repoId: entry.repoId, branch: entry.branch, workflow: entry.workflow, inputs: entry.inputs })
-    const next = [entry, ...this.getDeployHistory().filter((item) => JSON.stringify({ repoId: item.repoId, branch: item.branch, workflow: item.workflow, inputs: item.inputs || {} }) !== signature)].slice(0, DEPLOY_HISTORY_LIMIT)
-    await this.context.globalState.update(DEPLOY_HISTORY_KEY, next)
+    const next = [
+      entry,
+      ...this.getDeployHistoryForRepo(repoId).filter(
+        (item) => JSON.stringify({ repoId: item.repoId, branch: item.branch, workflow: item.workflow, inputs: item.inputs || {} }) !== signature
+      )
+    ].slice(0, DEPLOY_HISTORY_LIMIT)
+    await this.context.globalState.update(this.deployHistoryKey(repoId), next)
     return next
   }
 
-  async clearDeployHistory() {
-    await this.context.globalState.update(DEPLOY_HISTORY_KEY, [])
+  async clearDeployHistory(workspaceRoot) {
+    if (!workspaceRoot) return
+
+    const repoId = this.getRepoId(workspaceRoot)
+    await this.context.globalState.update(this.deployHistoryKey(repoId), [])
+
+    const legacyHistory = this.context.globalState.get(DEPLOY_HISTORY_KEY, [])
+    if (Array.isArray(legacyHistory) && legacyHistory.some((item) => item?.repoId === repoId)) {
+      await this.context.globalState.update(
+        DEPLOY_HISTORY_KEY,
+        legacyHistory.filter((item) => item?.repoId !== repoId)
+      )
+    }
   }
 
   getDeployPresets() {
@@ -156,7 +189,7 @@ class DeployViewProvider {
       }
 
       if (message.type === "clearHistory") {
-        await this.clearDeployHistory()
+        await this.clearDeployHistory(getWorkspaceRoot())
         webviewView.webview.postMessage({ type: "history", payload: { entries: [] } })
         return
       }
@@ -257,7 +290,7 @@ class DeployViewProvider {
         workflows: workflowMetadata.workflows,
         workflowError: workflowMetadata.error,
         githubAuth: getGithubAuthSummary(getGithubTransportOptions()),
-        deployHistory: this.getDeployHistory(),
+        deployHistory: this.getDeployHistory(workspaceRoot),
         deployPresets: this.getDeployPresets()
       }
     })
