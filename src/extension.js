@@ -14,6 +14,9 @@ const {
 
 const VIEW_ID = "pacvueCommerceDeployView"
 const RUN_STATUS_POLL_INTERVAL_MS = 60 * 1000
+const RUN_MATCH_CLOCK_SKEW_MS = 2 * 60 * 1000
+const STARTUP_COMMAND_TIMEOUT_MS = 10 * 1000
+const GIT_API_ACTIVATION_TIMEOUT_MS = 1500
 const DEPLOY_HISTORY_KEY = "pacvueDeploy.deployHistory"
 const DEPLOY_HISTORY_LIMIT = 10
 const DEPLOY_PRESETS_KEY = "pacvueDeploy.presets"
@@ -31,8 +34,9 @@ function deactivate() {}
 class DeployViewProvider {
   constructor(context) {
     this.context = context
-    this.pollTimer = null
-    this.activeRun = null
+    this.pollTimers = new Map()
+    this.activeRuns = new Map()
+    this.lastActiveRunId = null
   }
 
   // Builds a globalState key scoped per repo + workflow + branch so that cached
@@ -98,27 +102,100 @@ class DeployViewProvider {
     return this.getDeployHistoryForRepo(this.getRepoId(workspaceRoot))
   }
 
-  async appendDeployHistory(workspaceRoot, form, parsed) {
+  isDeployHistoryInProgress(entry) {
+    return entry?.deployState === "in_progress" || ["queued", "in_progress", "waiting", "pending", "requested", "polling", "cancelling", "cancel_pending"].includes(entry?.githubStatus)
+  }
+
+  buildParsedFromHistoryEntry(entry) {
+    return enrichDeployParsedResult({
+      targetBranch: entry?.branch || "",
+      workflow: {
+        file: entry?.workflow || "",
+        name: entry?.workflowName || entry?.workflow || ""
+      }
+    }, {
+      branch: entry?.branch || "",
+      workflow: entry?.workflow || ""
+    })
+  }
+
+  async appendDeployHistory(workspaceRoot, form, parsed, command) {
     const ts = Date.now()
     const repoId = this.getRepoId(workspaceRoot)
     const entry = {
-      id: String(ts),
+      id: `${ts}-${Math.random().toString(36).slice(2, 8)}`,
       ts,
       repoId,
       branch: parsed?.targetBranch || form.branch,
       workflow: form.workflow,
       workflowName: parsed?.workflow?.name || form.workflow,
-      inputs: { ...(form.inputs || {}) }
+      inputs: { ...(form.inputs || {}) },
+      command: command || "",
+      deployState: "in_progress",
+      githubStatus: "queued",
+      conclusion: null,
+      statusMessage: "Deploy workflow is in progress. Next status check runs in 1 minute.",
+      runId: null,
+      runUrl: null,
+      statusUpdatedAt: ts
     }
-    const signature = JSON.stringify({ repoId: entry.repoId, branch: entry.branch, workflow: entry.workflow, inputs: entry.inputs })
-    const next = [
-      entry,
-      ...this.getDeployHistoryForRepo(repoId).filter(
-        (item) => JSON.stringify({ repoId: item.repoId, branch: item.branch, workflow: item.workflow, inputs: item.inputs || {} }) !== signature
-      )
-    ].slice(0, DEPLOY_HISTORY_LIMIT)
+    const next = [entry, ...this.getDeployHistoryForRepo(repoId)].slice(0, DEPLOY_HISTORY_LIMIT)
     await this.context.globalState.update(this.deployHistoryKey(repoId), next)
     return next
+  }
+
+  async updateDeployHistoryStatus(workspaceRoot, historyId, payload = {}) {
+    if (!workspaceRoot || !historyId) return null
+
+    const repoId = this.getRepoId(workspaceRoot)
+    const history = this.getDeployHistoryForRepo(repoId)
+    let updatedEntry = null
+    const next = history.map((entry) => {
+      if (entry?.id !== historyId) return entry
+
+      const run = payload.run || {}
+      updatedEntry = {
+        ...entry,
+        deployState: payload.state || entry.deployState || "unknown",
+        githubStatus: payload.status || entry.githubStatus || "",
+        conclusion: payload.conclusion ?? entry.conclusion ?? null,
+        statusMessage: payload.message || entry.statusMessage || "",
+        runId: run.databaseId ?? entry.runId ?? null,
+        runUrl: run.url ?? entry.runUrl ?? null,
+        statusUpdatedAt: Date.now()
+      }
+      return updatedEntry
+    })
+
+    if (!updatedEntry) return null
+
+    await this.context.globalState.update(this.deployHistoryKey(repoId), next)
+    return updatedEntry
+  }
+
+  async postRunStatus(webviewView, workspaceRoot, historyId, payload) {
+    const historyEntry = await this.updateDeployHistoryStatus(workspaceRoot, historyId, payload)
+    webviewView.webview.postMessage({
+      type: "runStatus",
+      payload: {
+        ...payload,
+        ...(historyId ? { historyId } : {}),
+        ...(historyEntry ? { historyEntry } : {})
+      }
+    })
+  }
+
+  resumeDeployHistoryPolling(webviewView, workspaceRoot, deployHistory) {
+    if (!workspaceRoot || !Array.isArray(deployHistory)) return
+
+    deployHistory.forEach((entry) => {
+      if (!entry?.id || !this.isDeployHistoryInProgress(entry) || this.activeRuns.has(entry.id)) return
+
+      const parsed = this.buildParsedFromHistoryEntry(entry)
+      if (!parsed?.workflow?.file || !parsed?.targetBranch) return
+
+      this.startRunStatusPolling(webviewView, workspaceRoot, parsed, entry.command || "", entry.id, entry.ts || Date.now())
+    })
   }
 
   async clearDeployHistory(workspaceRoot) {
@@ -174,7 +251,7 @@ class DeployViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (message) => {
       if (message.type === "ready") {
-        await this.postInitialState(webviewView)
+        await this.postInitialStateSafely(webviewView)
         return
       }
 
@@ -189,7 +266,9 @@ class DeployViewProvider {
       }
 
       if (message.type === "clearHistory") {
-        await this.clearDeployHistory(getWorkspaceRoot())
+        const workspaceRoot = getWorkspaceRoot()
+        this.getDeployHistory(workspaceRoot).forEach((entry) => this.stopRunStatusPolling(entry.id))
+        await this.clearDeployHistory(workspaceRoot)
         webviewView.webview.postMessage({ type: "history", payload: { entries: [] } })
         return
       }
@@ -216,7 +295,7 @@ class DeployViewProvider {
       }
 
       if (message.type === "cancel") {
-        await this.cancelDeployCommand(webviewView)
+        await this.cancelDeployCommand(webviewView, message.payload)
       }
     })
   }
@@ -268,6 +347,43 @@ class DeployViewProvider {
     })
   }
 
+  async postInitialStateSafely(webviewView) {
+    try {
+      await this.postInitialState(webviewView)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to load Pacvue Deploy panel."
+      webviewView.webview.postMessage({
+        type: "state",
+        payload: {
+          workspaceRoot: getWorkspaceRoot(),
+          currentBranch: "",
+          branchOptions: [],
+          branchError: message,
+          branchDebug: null,
+          branchDiagnosis: buildBranchDiagnosis({ workspaceRoot: getWorkspaceRoot() }),
+          scriptPath: null,
+          workflows: [],
+          workflowError: message,
+          githubAuth: null,
+          deployHistory: [],
+          deployPresets: this.getDeployPresets()
+        }
+      })
+      webviewView.webview.postMessage({
+        type: "result",
+        payload: {
+          ok: false,
+          status: 1,
+          action: "load",
+          parsed: null,
+          stdout: "",
+          stderr: message,
+          command: ""
+        }
+      })
+    }
+  }
+
   async postInitialState(webviewView) {
     const workspaceRoot = getWorkspaceRoot()
     const branchResult = workspaceRoot
@@ -276,6 +392,7 @@ class DeployViewProvider {
     const currentBranch = branchResult.currentBranch || ""
     const scriptPath = workspaceRoot ? findDeployScript(workspaceRoot, this.context.extensionPath) : null
     const workflowMetadata = workspaceRoot && scriptPath ? getWorkflowMetadata(scriptPath, workspaceRoot) : { workflows: [], error: null }
+    const deployHistory = this.getDeployHistory(workspaceRoot)
 
     webviewView.webview.postMessage({
       type: "state",
@@ -289,8 +406,8 @@ class DeployViewProvider {
         scriptPath,
         workflows: workflowMetadata.workflows,
         workflowError: workflowMetadata.error,
-        githubAuth: getGithubAuthSummary(getGithubTransportOptions()),
-        deployHistory: this.getDeployHistory(workspaceRoot),
+        githubAuth: null,
+        deployHistory,
         deployPresets: this.getDeployPresets()
       }
     })
@@ -325,11 +442,14 @@ class DeployViewProvider {
 
     if (action === "dispatch" && ok) {
       this.saveLastInputs(workspaceRoot, form.workflow, form.branch, form.inputs)
-      const deployHistory = await this.appendDeployHistory(workspaceRoot, form, parsed)
+      const deployHistory = await this.appendDeployHistory(workspaceRoot, form, parsed, command)
+      const historyEntry = deployHistory[0] || null
       webviewView.webview.postMessage({ type: "history", payload: { entries: deployHistory } })
       webviewView.webview.postMessage({
         type: "runStatus",
         payload: {
+          historyId: historyEntry?.id,
+          historyEntry,
           state: "in_progress",
           status: "queued",
           conclusion: null,
@@ -338,7 +458,7 @@ class DeployViewProvider {
           message: "Deploy workflow is in progress. Next status check runs in 1 minute."
         }
       })
-      this.startRunStatusPolling(webviewView, workspaceRoot, parsed, command)
+      this.startRunStatusPolling(webviewView, workspaceRoot, parsed, command, historyEntry?.id, historyEntry?.ts || Date.now())
       return
     }
 
@@ -366,70 +486,82 @@ class DeployViewProvider {
     }
   }
 
-  startRunStatusPolling(webviewView, workspaceRoot, parsed, command) {
-    this.stopRunStatusPolling()
-
+  startRunStatusPolling(webviewView, workspaceRoot, parsed, command, historyId, startedAt = Date.now()) {
     const workflowFile = normalizeWorkflowFileForGh(parsed?.workflow?.file)
     const targetBranch = parsed?.targetBranch
+    const runKey = historyId || `${workflowFile || "workflow"}::${targetBranch || "branch"}`
+
+    this.stopRunStatusPolling()
+
     if (!workflowFile || !targetBranch) {
-      webviewView.webview.postMessage({
-        type: "runStatus",
-        payload: {
-          state: "unknown",
-          status: "unknown",
-          conclusion: null,
-          parsed,
-          command,
-          message: "Workflow was triggered, but run status cannot be polled because workflow or branch metadata is missing."
-        }
+      void this.postRunStatus(webviewView, workspaceRoot, historyId, {
+        state: "unknown",
+        status: "unknown",
+        conclusion: null,
+        parsed,
+        command,
+        message: "Workflow was triggered, but run status cannot be polled because workflow or branch metadata is missing."
       })
       return
     }
 
-    this.activeRun = {
+    this.activeRuns.set(runKey, {
+      historyId,
       workspaceRoot,
       workflowFile,
       targetBranch,
       parsed,
-      command
-    }
+      command,
+      startedAt
+    })
+    this.lastActiveRunId = runKey
 
     const poll = async () => {
+      if (!this.activeRuns.has(runKey)) {
+        return
+      }
+
       const run = await getLatestWorkflowRunWithFallback(workspaceRoot, workflowFile, targetBranch)
       if (!run.ok) {
-        webviewView.webview.postMessage({
-          type: "runStatus",
-          payload: {
-            state: "in_progress",
-            status: "polling",
-            conclusion: null,
-            parsed,
-            command,
-            message: run.error || "Workflow is still in progress. Next status check runs in 1 minute."
-          }
+        await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+          state: "in_progress",
+          status: "polling",
+          conclusion: null,
+          parsed,
+          command,
+          message: run.error || "Workflow is still in progress. Next status check runs in 1 minute."
+        })
+        return
+      }
+
+      if (!isWorkflowRunForDispatch(run, startedAt)) {
+        await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+          state: "in_progress",
+          status: "polling",
+          conclusion: null,
+          parsed,
+          command,
+          message: "Waiting for the workflow run created by this deploy to appear. Next status check runs in 1 minute."
         })
         return
       }
 
       if (!isWorkflowRunInProgress(run.status)) {
-        this.stopRunStatusPolling()
+        this.stopRunStatusPolling(runKey)
         const state = getCompletedRunState(run)
         const jobsSummary = state === "failed" ? await getRunJobsSummaryForDiagnosis(workspaceRoot, run) : null
         const failureDiagnosis = state === "failed" ? buildFailureDiagnosis({ run, parsed, conclusion: run.conclusion, jobsSummary }) : null
 
-        webviewView.webview.postMessage({
-          type: "runStatus",
-          payload: {
-            state,
-            status: run.status,
-            conclusion: run.conclusion,
-            run,
-            parsed,
-            command,
-            message: getCompletedRunMessage(state),
-            jobsSummary,
-            failureDiagnosis
-          }
+        await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+          state,
+          status: run.status,
+          conclusion: run.conclusion,
+          run,
+          parsed,
+          command,
+          message: getCompletedRunMessage(state),
+          jobsSummary,
+          failureDiagnosis
         })
 
         if (state === "failed") {
@@ -452,79 +584,97 @@ class DeployViewProvider {
         return
       }
 
-      webviewView.webview.postMessage({
-        type: "runStatus",
-        payload: {
-          state: "in_progress",
-          status: run.status,
-          conclusion: run.conclusion,
-          run,
-          parsed,
-          command,
-          message: "Deploy workflow is still in progress. Next status check runs in 1 minute."
-        }
+      await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+        state: "in_progress",
+        status: run.status,
+        conclusion: run.conclusion,
+        run,
+        parsed,
+        command,
+        message: "Deploy workflow is still in progress. Next status check runs in 1 minute."
       })
     }
 
     void poll()
-    this.pollTimer = setInterval(() => {
+    const timer = setInterval(() => {
       void poll()
     }, RUN_STATUS_POLL_INTERVAL_MS)
+    this.pollTimers.set(runKey, timer)
   }
 
-  stopRunStatusPolling() {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer)
-      this.pollTimer = null
+  stopRunStatusPolling(runKey) {
+    if (runKey === undefined) {
+      this.pollTimers.forEach((timer) => clearInterval(timer))
+      this.pollTimers.clear()
+      this.activeRuns.clear()
+      this.lastActiveRunId = null
+      return
     }
-    this.activeRun = null
+
+    const timer = this.pollTimers.get(runKey)
+    if (timer) {
+      clearInterval(timer)
+      this.pollTimers.delete(runKey)
+    }
+    this.activeRuns.delete(runKey)
+
+    if (this.lastActiveRunId === runKey) {
+      const keys = Array.from(this.activeRuns.keys())
+      this.lastActiveRunId = keys.length ? keys[keys.length - 1] : null
+    }
   }
 
-  async cancelDeployCommand(webviewView) {
-    if (!this.activeRun) {
-      webviewView.webview.postMessage({
-        type: "runStatus",
-        payload: {
-          state: "failed",
-          status: "cancel_failed",
-          conclusion: "failure",
-          message: "No in-progress deploy workflow is available to cancel."
-        }
+  async cancelDeployCommand(webviewView, payload = {}) {
+    const requestedRunKey = String(payload?.historyId ?? "").trim()
+    const runKey = requestedRunKey && this.activeRuns.has(requestedRunKey) ? requestedRunKey : this.lastActiveRunId
+    const activeRun = runKey ? this.activeRuns.get(runKey) : null
+    if (!activeRun) {
+      await this.postRunStatus(webviewView, getWorkspaceRoot(), null, {
+        state: "failed",
+        status: "cancel_failed",
+        conclusion: "failure",
+        message: "No in-progress deploy workflow is available to cancel."
       })
       return
     }
 
-    const { workspaceRoot, workflowFile, targetBranch, parsed, command } = this.activeRun
+    const { workspaceRoot, workflowFile, targetBranch, parsed, command, historyId, startedAt } = activeRun
     const run = await getLatestWorkflowRunWithFallback(workspaceRoot, workflowFile, targetBranch)
     if (!run.ok) {
-      webviewView.webview.postMessage({
-        type: "runStatus",
-        payload: {
-          state: "in_progress",
-          status: "cancel_pending",
-          conclusion: null,
-          parsed,
-          command,
-          message: run.error || "Could not find workflow run to cancel yet. Polling will continue."
-        }
+      await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+        state: "in_progress",
+        status: "cancel_pending",
+        conclusion: null,
+        parsed,
+        command,
+        message: run.error || "Could not find workflow run to cancel yet. Polling will continue."
+      })
+      return
+    }
+
+    if (!isWorkflowRunForDispatch(run, startedAt)) {
+      await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+        state: "in_progress",
+        status: "cancel_pending",
+        conclusion: null,
+        parsed,
+        command,
+        message: "Could not find this deploy's workflow run to cancel yet. Polling will continue."
       })
       return
     }
 
     if (!isWorkflowRunInProgress(run.status)) {
-      this.stopRunStatusPolling()
+      this.stopRunStatusPolling(runKey)
       const state = getCompletedRunState(run)
-      webviewView.webview.postMessage({
-        type: "runStatus",
-        payload: {
-          state,
-          status: run.status,
-          conclusion: run.conclusion,
-          run,
-          parsed,
-          command,
-          message: getCompletedRunMessage(state)
-        }
+      await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+        state,
+        status: run.status,
+        conclusion: run.conclusion,
+        run,
+        parsed,
+        command,
+        message: getCompletedRunMessage(state)
       })
 
       if (state === "success") {
@@ -535,19 +685,16 @@ class DeployViewProvider {
 
     const cancelResult = await cancelWorkflowRunWithFallback(workspaceRoot, run.databaseId)
 
-    webviewView.webview.postMessage({
-      type: "runStatus",
-      payload: {
-        state: "in_progress",
-        status: cancelResult.ok ? "cancelling" : "cancel_failed",
-        conclusion: null,
-        run,
-        parsed,
-        command,
-        message: cancelResult.ok
-          ? "Cancel requested. Waiting for GitHub to confirm cancellation."
-          : cancelResult.error || "Failed to cancel workflow run."
-      }
+    await this.postRunStatus(webviewView, workspaceRoot, historyId, {
+      state: "in_progress",
+      status: cancelResult.ok ? "cancelling" : "cancel_failed",
+      conclusion: null,
+      run,
+      parsed,
+      command,
+      message: cancelResult.ok
+        ? "Cancel requested. Waiting for GitHub to confirm cancellation."
+        : cancelResult.error || "Failed to cancel workflow run."
     })
   }
 
@@ -695,7 +842,6 @@ class DeployViewProvider {
         <p class="eyebrow">Pacvue Commerce</p>
         <h1>Deploy</h1>
       </div>
-      <span class="status-pill" id="statusPill">Idle</span>
     </section>
 
     <section class="panel">
@@ -717,11 +863,10 @@ class DeployViewProvider {
 
       <p class="cache-status" id="cacheStatus">Last config: not loaded</p>
 
-      <div class="actions">
+      <div class="form-actions">
         <button id="runButton">Run</button>
-        <button id="cancelButton" class="danger" disabled>Cancel</button>
+        <button id="savePresetButton" class="muted-action">Save as Preset</button>
       </div>
-      <button id="savePresetButton" class="muted-action save-preset-btn">Save as Preset</button>
     </section>
 
     <details class="panel presets-panel" id="presetsPanel" hidden>
@@ -812,7 +957,7 @@ function findDeployScript(workspaceRoot, extensionRoot) {
 }
 
 function getWorkflowMetadata(scriptPath, workspaceRoot) {
-  const result = runCommand("node", [scriptPath, "--list-workflows-json"], workspaceRoot)
+  const result = runCommand("node", [scriptPath, "--list-workflows-json"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS })
   const parsed = parseJsonOutput(result.stdout)
 
   return {
@@ -871,8 +1016,8 @@ function getCommandEnv() {
   return env
 }
 
-function runGitCommand(args, cwd) {
-  return runCommand(getGitExecutable(), args, cwd)
+function runGitCommand(args, cwd, options) {
+  return runCommand(getGitExecutable(), args, cwd, options)
 }
 
 function splitCommandOutput(stdout) {
@@ -939,11 +1084,24 @@ function buildEmptyBranchResult(error, diagnosis) {
   }
 }
 
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+  })
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) {
+      clearTimeout(timer)
+    }
+  })
+}
+
 function inspectGitWorkspace(workspaceRoot) {
   const git = getGitExecutable()
-  const insideWorkTree = runGitCommand(["rev-parse", "--is-inside-work-tree"], workspaceRoot)
-  const topLevel = runGitCommand(["rev-parse", "--show-toplevel"], workspaceRoot)
-  const showCurrent = runGitCommand(["branch", "--show-current"], workspaceRoot)
+  const insideWorkTree = runGitCommand(["rev-parse", "--is-inside-work-tree"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS })
+  const topLevel = runGitCommand(["rev-parse", "--show-toplevel"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS })
+  const showCurrent = runGitCommand(["branch", "--show-current"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS })
 
   return {
     gitExecutable: git,
@@ -1114,7 +1272,16 @@ async function getBranchOptionsFromGitApi(workspaceRoot) {
   }
 
   if (!gitExtension.isActive) {
-    await gitExtension.activate()
+    try {
+      await withTimeout(gitExtension.activate(), GIT_API_ACTIVATION_TIMEOUT_MS, "VS Code Git extension activation timed out.")
+    } catch (error) {
+      return {
+        branches: [],
+        currentBranch: "",
+        error: error instanceof Error ? error.message : "VS Code Git extension activation timed out.",
+        debug: { source: "git-api", workspaceRoot, gitExtensionAvailable: true, activationTimedOut: true }
+      }
+    }
   }
 
   const gitApi = gitExtension.exports?.getAPI?.(1)
@@ -1128,10 +1295,25 @@ async function getBranchOptionsFromGitApi(workspaceRoot) {
     }
   }
 
-  const [localRefs, remoteRefs] = await Promise.all([
-    repository.getBranches({ remote: false }),
-    repository.getBranches({ remote: true })
-  ])
+  let localRefs = []
+  let remoteRefs = []
+  try {
+    ;[localRefs, remoteRefs] = await withTimeout(
+      Promise.all([
+        repository.getBranches({ remote: false }),
+        repository.getBranches({ remote: true })
+      ]),
+      GIT_API_ACTIVATION_TIMEOUT_MS,
+      "VS Code Git extension branch lookup timed out."
+    )
+  } catch (error) {
+    return {
+      branches: [],
+      currentBranch: normalizeBranchName(repository.state?.HEAD?.name ?? ""),
+      error: error instanceof Error ? error.message : "VS Code Git extension branch lookup timed out.",
+      debug: { source: "git-api", workspaceRoot, repositoryRoot: repository.rootUri.fsPath, branchLookupTimedOut: true }
+    }
+  }
   const branches = collectBranchNamesFromRefs([...(localRefs ?? []), ...(remoteRefs ?? [])])
   const currentBranch = normalizeBranchName(repository.state?.HEAD?.name ?? "")
 
@@ -1158,15 +1340,16 @@ function getBranchOptionsFromGitCommand(workspaceRoot, currentBranch = "") {
   const forEachRefResult = runCommand(
     git,
     ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"],
-    workspaceRoot
+    workspaceRoot,
+    { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS }
   )
 
   let branchNames = []
   if (forEachRefResult.status === 0 && forEachRefResult.stdout.trim()) {
     branchNames = splitCommandOutput(forEachRefResult.stdout).map(normalizeBranchName).filter(isValidBranchName)
   } else {
-    const localResult = runCommand(git, ["branch", "--list"], workspaceRoot)
-    const remoteResult = runCommand(git, ["branch", "-r", "--list"], workspaceRoot)
+    const localResult = runCommand(git, ["branch", "--list"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS })
+    const remoteResult = runCommand(git, ["branch", "-r", "--list"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS })
 
     if (localResult.status !== 0 && remoteResult.status !== 0) {
       const spawnError = localResult.stderr || remoteResult.stderr
@@ -1195,7 +1378,7 @@ function getBranchOptionsFromGitCommand(workspaceRoot, currentBranch = "") {
   }
 
   const resolvedCurrent =
-    normalizedCurrent || normalizeBranchName(runGitCommand(["branch", "--show-current"], workspaceRoot).stdout)
+    normalizedCurrent || normalizeBranchName(runGitCommand(["branch", "--show-current"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS }).stdout)
   const branches = [...new Set([resolvedCurrent, ...branchNames].filter(isValidBranchName))]
   return {
     branches,
@@ -1208,8 +1391,8 @@ function getBranchOptionsFromGitCommand(workspaceRoot, currentBranch = "") {
       forEachRefStatus: forEachRefResult.status,
       forEachRefStderr: forEachRefResult.stderr.trim(),
       forEachRefStdoutLength: forEachRefResult.stdout.length,
-      localBranchCount: parsePlainBranchOutput(runCommand(git, ["branch", "--list"], workspaceRoot).stdout).length,
-      remoteBranchCount: parsePlainBranchOutput(runCommand(git, ["branch", "-r", "--list"], workspaceRoot).stdout).length,
+      localBranchCount: parsePlainBranchOutput(runCommand(git, ["branch", "--list"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS }).stdout).length,
+      remoteBranchCount: parsePlainBranchOutput(runCommand(git, ["branch", "-r", "--list"], workspaceRoot, { timeoutMs: STARTUP_COMMAND_TIMEOUT_MS }).stdout).length,
       branchCount: branches.length
     }
   }
@@ -1240,6 +1423,15 @@ async function getBranchOptions(workspaceRoot) {
 
 function isWorkflowRunInProgress(status) {
   return ["queued", "in_progress", "waiting", "pending", "requested"].includes(status)
+}
+
+function isWorkflowRunForDispatch(run, startedAt) {
+  if (!startedAt) return true
+
+  const createdAt = Date.parse(run?.createdAt || "")
+  if (!Number.isFinite(createdAt)) return true
+
+  return createdAt >= startedAt - RUN_MATCH_CLOCK_SKEW_MS
 }
 
 function getCompletedRunState(run) {
@@ -1544,12 +1736,13 @@ async function cancelWorkflowRunWithFallback(workspaceRoot, runId) {
   })
 }
 
-function runCommand(command, args, cwd) {
+function runCommand(command, args, cwd, options = {}) {
   const result = childProcess.spawnSync(command, args, {
     cwd,
     encoding: "utf8",
     maxBuffer: 1024 * 1024 * 10,
-    env: getCommandEnv()
+    env: getCommandEnv(),
+    ...(options.timeoutMs ? { timeout: options.timeoutMs } : {})
   })
 
   return {

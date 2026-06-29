@@ -22,8 +22,8 @@ select {
 .shell {
   position: relative;
   display: grid;
-  gap: 14px;
-  padding: 14px;
+  gap: 12px;
+  padding: 12px;
 }
 
 .hero {
@@ -53,28 +53,6 @@ h1 {
   line-height: 1.05;
 }
 
-.status-pill {
-  flex: 0 0 auto;
-  padding: 4px 9px;
-  border: 1px solid var(--vscode-button-border);
-  border-radius: 999px;
-  color: var(--vscode-descriptionForeground);
-  background: var(--vscode-badge-background);
-  font-size: 11px;
-}
-
-.status-pill[data-variant="ready"] {
-  color: var(--vscode-testing-iconPassed);
-}
-
-.status-pill[data-variant="running"] {
-  color: var(--vscode-testing-iconQueued);
-}
-
-.status-pill[data-variant="error"] {
-  color: var(--vscode-testing-iconFailed);
-}
-
 .cache-status {
   margin: -4px 0 0;
   color: var(--vscode-descriptionForeground);
@@ -102,9 +80,9 @@ h1 {
 .panel {
   display: grid;
   gap: 12px;
-  padding: 12px;
+  padding: 10px;
   border: 1px solid var(--vscode-sideBarSectionHeader-border);
-  border-radius: 12px;
+  border-radius: 8px;
   background: var(--vscode-editor-background);
 }
 
@@ -188,7 +166,7 @@ select {
   min-height: 30px;
   padding: 5px 8px;
   border: 1px solid var(--vscode-input-border);
-  border-radius: 8px;
+  border-radius: 6px;
   color: var(--vscode-input-foreground);
   background: var(--vscode-input-background);
 }
@@ -213,7 +191,7 @@ button:focus {
   min-height: 30px;
   padding: 5px 28px 5px 8px;
   border: 1px solid var(--vscode-input-border);
-  border-radius: 8px;
+  border-radius: 6px;
   color: var(--vscode-input-foreground);
   background: var(--vscode-input-background);
   text-align: left;
@@ -237,7 +215,7 @@ button:focus {
   max-height: 240px;
   padding: 6px;
   border: 1px solid var(--vscode-input-border);
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--vscode-dropdown-background);
   box-shadow: 0 8px 20px rgb(0 0 0 / 22%);
 }
@@ -279,9 +257,19 @@ button:focus {
 }
 
 .actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-start;
 }
 
 .history-panel[hidden],
@@ -338,6 +326,29 @@ button:focus {
   white-space: nowrap;
 }
 
+.history-status {
+  justify-self: end;
+  max-width: 112px;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-status[data-variant="ready"] {
+  color: var(--vscode-testing-iconPassed);
+}
+
+.history-status[data-variant="running"] {
+  color: var(--vscode-testing-iconQueued);
+}
+
+.history-status[data-variant="error"] {
+  color: var(--vscode-testing-iconFailed);
+}
+
 .history-reuse,
 .muted-action {
   min-height: 24px;
@@ -348,18 +359,20 @@ button:focus {
 .history-actions,
 .preset-actions {
   display: flex;
-  gap: 20px;
+  flex-wrap: wrap;
+  gap: 6px;
   justify-content: flex-end;
-}
-
-.save-preset-btn {
-  width: 100%;
 }
 
 .muted-action {
   color: var(--vscode-descriptionForeground);
   background: transparent;
   border: 1px solid var(--vscode-input-border);
+}
+
+.danger-action {
+  color: var(--vscode-errorForeground);
+  border-color: color-mix(in srgb, var(--vscode-errorForeground) 55%, transparent);
 }
 
 .confirm-overlay {
@@ -474,9 +487,11 @@ button:focus {
 }
 
 button {
-  min-height: 32px;
+  min-height: 28px;
+  width: auto;
+  padding: 4px 12px;
   border: 0;
-  border-radius: 9px;
+  border-radius: 6px;
   color: var(--vscode-button-foreground);
   background: var(--vscode-button-background);
   cursor: pointer;
@@ -511,7 +526,7 @@ button.danger {
 .output {
   overflow: hidden;
   border: 1px solid var(--vscode-sideBarSectionHeader-border);
-  border-radius: 12px;
+  border-radius: 8px;
   background: var(--vscode-editor-background);
 }
 

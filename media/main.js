@@ -7,10 +7,8 @@ const elements = {
   workflow: document.getElementById("workflow"),
   dynamicInputs: document.getElementById("dynamicInputs"),
   runButton: document.getElementById("runButton"),
-  cancelButton: document.getElementById("cancelButton"),
   copyButton: document.getElementById("copyButton"),
   output: document.getElementById("output"),
-  statusPill: document.getElementById("statusPill"),
   cacheStatus: document.getElementById("cacheStatus"),
   presetsPanel: document.getElementById("presetsPanel"),
   presetsList: document.getElementById("presetsList"),
@@ -36,6 +34,7 @@ let deployHistory = []
 let deployPresets = []
 let githubAuth = null
 let pendingDispatch = null
+const activeHistoryIds = new Set()
 const searchableSelects = new WeakMap()
 
 function getSelectedWorkflow() {
@@ -55,10 +54,7 @@ function getForm() {
   }
 }
 
-function setStatus(text, variant = "idle") {
-  elements.statusPill.textContent = text
-  elements.statusPill.dataset.variant = variant
-}
+function setStatus(_text, _variant = "idle") {}
 
 function setCacheStatus(text, variant = "idle") {
   elements.cacheStatus.textContent = text
@@ -68,7 +64,7 @@ function setCacheStatus(text, variant = "idle") {
 function setBusy(busy) {
   isBusy = busy
   elements.runButton.disabled = busy
-  elements.cancelButton.disabled = !busy
+  elements.runButton.textContent = busy ? "Running..." : "Run"
 }
 
 function setDeployEnabled(isEnabled) {
@@ -77,7 +73,7 @@ function setDeployEnabled(isEnabled) {
   setSearchableSelectDisabled(elements.branch, !isEnabled)
   setSearchableSelectDisabled(elements.workflow, !isEnabled)
   elements.runButton.disabled = !isEnabled
-  elements.cancelButton.disabled = true
+  elements.runButton.textContent = "Run"
 }
 
 function writeOutput(value) {
@@ -430,6 +426,74 @@ function formatHistoryInputs(inputs) {
   return entries.map(([key, value]) => `${key}=${value}`).join(", ")
 }
 
+function getHistoryStatusState(entry) {
+  if (entry?.deployState) return entry.deployState
+  if (entry?.conclusion === "success") return "success"
+  if (entry?.conclusion === "cancelled") return "cancelled"
+  if (entry?.conclusion) return "failed"
+  if (["queued", "in_progress", "waiting", "pending", "requested", "polling", "cancelling", "cancel_pending"].includes(entry?.githubStatus)) return "in_progress"
+  return "unknown"
+}
+
+function getHistoryStatusLabel(entry) {
+  const state = getHistoryStatusState(entry)
+  if (state === "success") return "Success"
+  if (state === "failed") return entry?.conclusion || "Failed"
+  if (state === "cancelled") return "Cancelled"
+  if (state === "in_progress") {
+    if (entry?.githubStatus === "queued") return "Queued"
+    if (entry?.githubStatus === "polling") return "Polling"
+    if (entry?.githubStatus === "cancelling") return "Cancelling"
+    if (entry?.githubStatus === "cancel_pending") return "Cancel pending"
+    return "In Progress"
+  }
+  return "Unknown"
+}
+
+function getHistoryStatusVariant(entry) {
+  const state = getHistoryStatusState(entry)
+  if (state === "success") return "ready"
+  if (state === "failed" || state === "cancelled") return "error"
+  if (state === "in_progress") return "running"
+  return "idle"
+}
+
+function formatHistoryStatusTitle(entry) {
+  return [
+    getHistoryStatusLabel(entry),
+    entry?.githubStatus ? `GitHub status: ${entry.githubStatus}` : null,
+    entry?.conclusion ? `Conclusion: ${entry.conclusion}` : null,
+    entry?.runId ? `Run ID: ${entry.runId}` : null,
+    entry?.statusMessage || null
+  ].filter(Boolean).join("\n")
+}
+
+function syncHistoryEntry(entry) {
+  if (!entry?.id) return
+
+  const existingIndex = deployHistory.findIndex((item) => item?.id === entry.id)
+  if (existingIndex === -1) {
+    deployHistory = [entry, ...deployHistory].slice(0, 10)
+  } else {
+    deployHistory = deployHistory.map((item, index) => (index === existingIndex ? { ...item, ...entry } : item))
+  }
+  renderHistory()
+}
+
+function syncActiveHistoryFromStatus(payload) {
+  if (!payload?.historyId) {
+    setBusy(payload?.state === "in_progress")
+    return
+  }
+
+  if (payload.state === "in_progress") {
+    activeHistoryIds.add(payload.historyId)
+  } else {
+    activeHistoryIds.delete(payload.historyId)
+  }
+  setBusy(activeHistoryIds.size > 0)
+}
+
 function applyHistoryEntry(entry) {
   if (!entry) return
 
@@ -540,6 +604,12 @@ function renderHistory() {
     meta.textContent = title
     meta.title = `${title}${entry.repoId ? `\n${entry.repoId}` : ""}`
 
+    const status = document.createElement("span")
+    status.className = "history-status"
+    status.dataset.variant = getHistoryStatusVariant(entry)
+    status.textContent = getHistoryStatusLabel(entry)
+    status.title = formatHistoryStatusTitle(entry)
+
     const inputs = document.createElement("div")
     inputs.className = "history-inputs"
     inputs.textContent = formatHistoryInputs(entry.inputs)
@@ -551,6 +621,8 @@ function renderHistory() {
 
     const actionRow = document.createElement("div")
     actionRow.className = "history-actions"
+    const isInProgress = getHistoryStatusState(entry) === "in_progress"
+    const canCancel = isInProgress && activeHistoryIds.has(entry.id)
 
     const reuse = document.createElement("button")
     reuse.type = "button"
@@ -558,14 +630,33 @@ function renderHistory() {
     reuse.textContent = "Reuse"
     reuse.addEventListener("click", () => applyHistoryEntry(entry))
 
-    const clear = document.createElement("button")
-    clear.type = "button"
-    clear.className = "muted-action"
-    clear.textContent = "Clear"
-    clear.addEventListener("click", () => vscode.postMessage({ type: "clearHistory" }))
+    if (entry.runUrl) {
+      const openRun = document.createElement("button")
+      openRun.type = "button"
+      openRun.className = "muted-action"
+      openRun.textContent = "Open Run"
+      openRun.addEventListener("click", () => vscode.postMessage({ type: "openExternal", url: entry.runUrl }))
+      actionRow.append(openRun)
+    }
 
-    actionRow.append(reuse, clear)
-    row.append(meta, inputs, time, actionRow)
+    if (canCancel) {
+      const cancel = document.createElement("button")
+      cancel.type = "button"
+      cancel.className = "muted-action danger-action"
+      cancel.textContent = "Cancel"
+      cancel.addEventListener("click", () => vscode.postMessage({ type: "cancel", payload: { historyId: entry.id } }))
+      actionRow.append(cancel)
+    } else if (!isInProgress) {
+      const clear = document.createElement("button")
+      clear.type = "button"
+      clear.className = "muted-action"
+      clear.textContent = "Clear"
+      clear.addEventListener("click", () => vscode.postMessage({ type: "clearHistory" }))
+      actionRow.append(clear)
+    }
+
+    actionRow.append(reuse)
+    row.append(meta, status, inputs, time, actionRow)
     elements.historyList.appendChild(row)
   })
 }
@@ -895,7 +986,6 @@ function submit(action) {
 }
 
 elements.runButton.addEventListener("click", () => submit("dispatch"))
-elements.cancelButton.addEventListener("click", () => vscode.postMessage({ type: "cancel" }))
 elements.copyButton.addEventListener("click", () => navigator.clipboard.writeText(elements.output.textContent))
 elements.confirmOkButton?.addEventListener("click", () => {
   if (!pendingDispatch) return
@@ -947,6 +1037,7 @@ window.addEventListener("message", (event) => {
     renderHistory()
     if (!payload.scriptPath) {
       setStatus("Script missing", "error")
+      writeOutput(payload.workflowError || "Could not find the deploy script in this workspace.")
       return
     }
     if (!payload.branchOptions?.length) {
@@ -980,12 +1071,23 @@ window.addEventListener("message", (event) => {
     if (payload.githubAuth?.ready) {
       writeOutput(`Ready. GitHub auth: ${payload.githubAuth.label}`)
     }
-    requestLastRunConfig()
     return
   }
 
   if (type === "history") {
     deployHistory = Array.isArray(payload.entries) ? payload.entries : []
+    if (!deployHistory.length) {
+      activeHistoryIds.clear()
+      setBusy(false)
+    } else {
+      const historyIds = new Set(deployHistory.map((entry) => entry?.id).filter(Boolean))
+      activeHistoryIds.forEach((id) => {
+        if (!historyIds.has(id)) activeHistoryIds.delete(id)
+      })
+      if (activeHistoryIds.size > 0) {
+        setBusy(true)
+      }
+    }
     renderHistory()
     return
   }
@@ -1028,11 +1130,18 @@ window.addEventListener("message", (event) => {
 
   if (type === "runStatus") {
     const isInProgress = payload.state === "in_progress"
-    setBusy(isInProgress)
-    setStatus(
-      payload.state === "success" ? "Success" : payload.state === "failed" ? "Failed" : payload.state === "cancelled" ? "Cancelled" : "In Progress",
-      payload.state === "failed" || payload.state === "cancelled" ? "error" : payload.state === "success" ? "ready" : "running"
-    )
+    syncActiveHistoryFromStatus(payload)
+    if (payload.historyEntry) {
+      syncHistoryEntry(payload.historyEntry)
+    }
+    if (payload.historyId || payload.historyEntry) {
+      setStatus(isInProgress ? "Running" : "Ready", isInProgress ? "running" : "ready")
+    } else {
+      setStatus(
+        payload.state === "success" ? "Success" : payload.state === "failed" ? "Failed" : payload.state === "cancelled" ? "Cancelled" : "In Progress",
+        payload.state === "failed" || payload.state === "cancelled" ? "error" : payload.state === "success" ? "ready" : "running"
+      )
+    }
     clearFailureCard()
     if (payload.state === "failed" && payload.failureDiagnosis) {
       renderFailureDiagnosisCard(payload.failureDiagnosis, payload)

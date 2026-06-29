@@ -2,8 +2,13 @@
 
 在 Cursor / VS Code 活动栏提供 **Pacvue Deploy** 面板，用于选择测试分支、workflow 与输入参数，触发 Pacvue Commerce 测试环境 GitHub Actions 发版，并轮询运行状态。
 
-## 最近更新（0.3.21）
+## 最近更新（0.3.26）
 
+- **面板 UI 精简**：移除右上角全局状态和主表单 Cancel，按钮改为自适应宽度，主操作区更紧凑。
+- **Recent Deploys 按状态显示按钮**：进行中的记录隐藏 Clear 并显示 Cancel；已有结果的记录隐藏 Cancel 和 Clear。
+- **只轮询最新发版**：旧的 Recent Deploys 记录不再查询状态；只有刚点击 Run 生成的最新记录会按间隔查询并更新进行中、成功、失败或取消状态。
+- **加载稳定性修复**：打开面板时不再立即恢复历史轮询，避免启动阶段被 GitHub 状态查询拖住；初始化失败时会在 Result 区显示错误信息。
+- **Recent Deploys 单条状态**：发版状态现在更新在 Recent Deploys 对应记录上，避免多条发版共用右上角单一状态导致显示不准确。
 - **Recent Deploys 项目隔离**：Recent Deploys 现在按当前 Commerce 仓库单独保存，不再和其他项目共用历史记录。
 - **发版确认**：点击 **Run** 后会先展示确认页，确认目标分支、workflow 与输入参数后再点击 **Confirm Deploy** 触发 GitHub Actions。
 - **上次配置回填**：选择分支和 workflow 后，插件会读取同仓库、同 workflow、同分支的上次发版配置；来源会显示为 `Last config: from GitHub last run`、`from local cache`、`from GitHub last run + local cache` 或 `unavailable`。
@@ -171,7 +176,7 @@ gh auth status
 
 ### 插件里看不到新功能
 
-确认已安装 `pacvue-commerce-deploy-visual-0.3.21.vsix` 或更新版本，并执行 **Developer: Reload Window**。如果仍看不到 **Presets**、**Recent Deploys**、确认页或失败诊断卡片，先卸载旧版扩展后重新从 VSIX 安装。
+确认已安装 `pacvue-commerce-deploy-visual-0.3.26.vsix` 或更新版本，并执行 **Developer: Reload Window**。如果仍看不到 **Presets**、**Recent Deploys**、确认页或失败诊断卡片，先卸载旧版扩展后重新从 VSIX 安装。
 
 ## 本地开发
 
